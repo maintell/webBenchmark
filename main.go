@@ -10,6 +10,7 @@ import (
 	"math/rand"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -85,10 +86,16 @@ func readableBytes(bytes float64) (expression string) {
 	return fmt.Sprintf("%.3f%s", bytes/math.Pow(1024, i), sizes[int(i)])
 }
 
-func goFun(Url string, Referer string, XforwardFor bool, wg *sync.WaitGroup) {
+func goFun(Url string, postContent string, Referer string, XforwardFor bool, wg *sync.WaitGroup) {
 	for true {
+		var request *http.Request
+		var err1 error = nil
 		client := &http.Client{}
-		request, err1 := http.NewRequest("GET", Url, nil)
+		if len(postContent) > 0 {
+			request, err1 = http.NewRequest("POST", Url, strings.NewReader(postContent))
+		} else {
+			request, err1 = http.NewRequest("GET", Url, nil)
+		}
 		if err1 != nil {
 			continue
 		}
@@ -117,6 +124,7 @@ func goFun(Url string, Referer string, XforwardFor bool, wg *sync.WaitGroup) {
 
 var count = flag.Int("c", 16, "cocurrent thread for download")
 var url = flag.String("s", "https://baidu.com", "target url")
+var postContent = flag.String("p", "", "post content")
 var referer = flag.String("r", "", "referer url")
 var xforwardfor = flag.Bool("f", false, "random X-Forwarded-For ip address")
 var TerminalWriter = goterminal.New(os.Stdout)
@@ -130,7 +138,7 @@ func main() {
 	}
 	for i := 0; i < *count; i++ {
 		waitgroup.Add(1)
-		go goFun(*url, *referer, *xforwardfor, &waitgroup)
+		go goFun(*url, *postContent, *referer, *xforwardfor, &waitgroup)
 	}
 	waitgroup.Wait()
 	TerminalWriter.Reset()
