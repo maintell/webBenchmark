@@ -1,6 +1,7 @@
 # webBenchmark
 http benchmark tool to ran out your server bandwidth.
 - random User-Agent on every Request
+- random x-forward-for and x-Real-ip on every Request
 - customizable Referer Url
 - cocurrent thread as you wish, depends on you server performance.
 - post method added.
@@ -11,6 +12,8 @@ http benchmark tool to ran out your server bandwidth.
           cocurrent thread for download (default 8)
     -r string
           referer url
+    -f
+          random x-forward-for and x-Real-ip header.
     -p string
           post content, request will be get if missing. otherwise post
     -s string
