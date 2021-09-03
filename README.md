@@ -25,11 +25,11 @@ http benchmark tool to ran out your server bandwidth.
     ./webBenchmark_linux_x64 -c 32 -s https://target.url
 
 # Docker:
--add docker support
+- add docker support
 Run:
 
     docker run -d  --name dl --restart=always  developer024/networkdownload:latest
     
 variable explaation:
--th:  cocurrent thread for download (default 8)
--url:   target url (default "http://dlied5.myapp.com/myapp/1104466820/sgame/2017_com.tencent.tmgp.sgame_h8218_1.43.1.15_fc9dc4.apk")
+- th:  cocurrent thread for download (default 8)
+- url:   target url (default "http://dlied5.myapp.com/myapp/1104466820/sgame/2017_com.tencent.tmgp.sgame_h8218_1.43.1.15_fc9dc4.apk")
