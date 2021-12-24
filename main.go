@@ -3,6 +3,7 @@ package main
 import (
 	"container/list"
 	"context"
+	"crypto/tls"
 	"flag"
 	"fmt"
 	"github.com/EDDYCJY/fake-useragent"
@@ -30,7 +31,7 @@ import (
 
 const (
 	letterIdxBits = 6
-	letterIdxMask = 1<<letterIdxBits - 1
+	letterIdxMask = 1 << letterIdxBits - 1
 	letterIdxMax  = 63 / letterIdxBits
 )
 
@@ -43,14 +44,13 @@ const letterBytes = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
 
 var SpeedQueue = list.New()
 var SpeedIndex uint64 = 0
-
 type ipArray []string
 
 func (i *ipArray) String() string {
 	return strings.Join(*i, ",")
 }
 
-func (i *ipArray) Set(value string) error {
+func (i *ipArray) Set(value string) (err error) {
 	*i = append(*i, strings.TrimSpace(value))
 	return nil
 }
@@ -192,8 +192,10 @@ func nslookup(targetAddress, server string) (res []string) {
 		return res
 	}
 	for _, ans := range r.Answer {
-		Arecord := ans.(*dns.A)
-		res = append(res, fmt.Sprintf("%s", Arecord))
+		if ans.Header().Rrtype == dns.TypeA {
+			Arecord := ans.(*dns.A)
+			res = append(res, fmt.Sprintf("%s", Arecord))
+		}
 	}
 	return
 }
@@ -204,18 +206,35 @@ func goFun(Url string, postContent string, Referer string, XforwardFor bool, cus
 			go goFun(Url, postContent, Referer, XforwardFor, customIP, wg)
 		}
 	}()
+
+	transport := &http.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+	}
+
 	for true {
 		if customIP != nil && len(customIP) > 0 {
 			dialer := &net.Dialer{
 				Timeout:   30 * time.Second,
 				KeepAlive: 30 * time.Second,
 			}
-			http.DefaultTransport.(*http.Transport).DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+			transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
 				rand.Seed(time.Now().Unix())
 				ip := customIP[rand.Intn(len(customIP))]
-				if strings.HasPrefix(addr,"https"){
+				if strings.HasPrefix(addr, "https") {
 					addr = ip + ":443"
-				} else if strings.HasPrefix(addr,"http") {
+				} else if strings.HasPrefix(addr, "http") {
+					addr = ip + ":80"
+				} else {
+					addr = ip + ":80"
+				}
+				return dialer.DialContext(ctx, network, addr)
+			}
+			transport.DialTLSContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+				rand.Seed(time.Now().Unix())
+				ip := customIP[rand.Intn(len(customIP))]
+				if strings.HasPrefix(addr, "https") {
+					addr = ip + ":443"
+				} else if strings.HasPrefix(addr, "http") {
 					addr = ip + ":80"
 				} else {
 					addr = ip + ":80"
@@ -226,7 +245,10 @@ func goFun(Url string, postContent string, Referer string, XforwardFor bool, cus
 
 		var request *http.Request
 		var err1 error = nil
-		client := &http.Client{}
+		client := &http.Client{
+			Transport: transport,
+			Timeout: time.Second*10,
+		}
 		if len(postContent) > 0 {
 			request, err1 = http.NewRequest("POST", Url, strings.NewReader(postContent))
 		} else {
@@ -251,14 +273,13 @@ func goFun(Url string, postContent string, Referer string, XforwardFor bool, cus
 		if err2 != nil {
 			continue
 		}
-		_, err3 := io.Copy(ioutil.Discard, resp.Body)
-		if err3 != nil {
-			continue
-		}
+		io.Copy(ioutil.Discard, resp.Body)
+		resp.Body.Close()
+
 	}
 	wg.Done()
 }
-
+var h = flag.Bool("h", false, "this help")
 var count = flag.Int("c", 16, "concurrent thread for download,default 8")
 var url = flag.String("s", "https://baidu.com", "target url")
 var postContent = flag.String("p", "", "post content")
@@ -267,9 +288,33 @@ var xforwardfor = flag.Bool("f", true, "randomized X-Forwarded-For and X-Real-IP
 var TerminalWriter = goterminal.New(os.Stdout)
 var customIP ipArray
 
+func usage() {
+	fmt.Fprintf(os.Stderr,
+`webBenchmark version: /0.4
+Usage: webBenchmark [-c concurrent] [-s target] [-p] [-r refererUrl] [-f] [-i ip]
+
+Options:
+`)
+	flag.PrintDefaults()
+	fmt.Fprintf(os.Stderr,
+`
+Advanced Example:
+webBenchmark -c 16 -s https://some.website -r https://referer.url -i 10.0.0.1 -i 10.0.0.2 
+	16 concurrent to benchmark https://some.website with https://referer.url directly to ip 10.0.0.1 and 10.0.0.2
+webBenchmark -c 16 -s https://some.website -r https://referer.url
+	16 concurrent to benchmark https://some.website with https://referer.url to dns resolved ip address
+
+`)
+}
+
 func main() {
 	flag.Var(&customIP, "i", "custom ip address for that domain, multiple addresses automatically will be assigned randomly")
+	flag.Usage = usage
 	flag.Parse()
+	if *h {
+		flag.Usage()
+		return
+	}
 	routines := *count
 
 	if customIP != nil && len(customIP) > 0 && routines < len(customIP){

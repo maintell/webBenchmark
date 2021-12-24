@@ -7,13 +7,13 @@ http benchmark tool to ran out your server bandwidth.
 - customizable Referer Url,
 - concurrent routines as you wish, depends on you server performance.
 - add http post mode
-- specify target ip, or resolved by system dns.
+- specify multi target ip, or resolved by system dns.
 - randomly X-Forwarded-For and X-Real-IP (default on).
 
 # Todo 
 - automatically tune concurrent routines to gain maximum performance. 
-- randomly target ip.
 - support NOT standard port in address with specify target ip.
+- subscription benchmark task from remote server.
 
 # Usage
     webBenchmark -c [COUNT] -s [URL] -r [REFERER]
@@ -24,7 +24,7 @@ http benchmark tool to ran out your server bandwidth.
     -s string
           target url (default "https://baidu.com")
     -i string
-          customize ip
+          custom ip address for that domain, multiple addresses automatically will be assigned randomly
     -f string
           randomized X-Forwarded-For and X-Real-IP address
     -p string
@@ -36,11 +36,12 @@ http benchmark tool to ran out your server bandwidth.
     ./webBenchmark_linux_x64 -c 32 -s https://target.url
 
 ## Advanced example
-    # send request to 1.1.1.1 for https://target.url with 32 concurrent threads 
+    # send request to 10.0.0.1 and 10.0.0.2 for https://target.url with 32 concurrent threads 
     # and refer is https://refer.url
-    ./webBenchmark_linux_x64 -c 32 -s https://target.url -r https://refer.url -i 1.1.1.1
+    ./webBenchmark_linux_x64 -c 32 -s https://target.url -r https://refer.url -i 10.0.0.1 -i 10.0.0.2 
 
 ##LICENSE AND DISCLAIMER
+
 **1. Application.**
 
 Please read this document carefully before using, accessing, downloading, installing or otherwise operating the webBenchmark as defined hereafter.

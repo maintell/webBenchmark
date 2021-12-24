@@ -9,6 +9,3 @@ go build -o webBenchmark_linux_arm
 SET GOOS=windows
 SET GOARCH=amd64
 go build -o webBenchmark_x64.exe
-SET GOOS=windows
-SET GOARCH=arm
-go build -o webBenchmark_x64_arm.exe
