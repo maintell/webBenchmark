@@ -34,7 +34,7 @@ http benchmark tool to ran out your server bandwidth.
           post content
 
 # Linux
-    wget https://github.com/maintell/webBenchmark/releases/download/0.3/webBenchmark_linux_x64
+    wget https://github.com/maintell/webBenchmark/releases/download/0.5/webBenchmark_linux_x64
     chmod +x webBenchmark_linux_x64
     ./webBenchmark_linux_x64 -c 32 -s https://target.url
 
