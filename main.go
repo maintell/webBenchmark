@@ -13,6 +13,7 @@ import (
 	"math/rand"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -44,6 +45,33 @@ const letterBytes = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
 
 var SpeedQueue = list.New()
 var SpeedIndex uint64 = 0
+
+
+type header struct {
+	key, value string
+}
+
+type headersList []header
+
+func (h *headersList) String() string {
+	return fmt.Sprint(*h)
+}
+
+func (h *headersList) IsCumulative() bool {
+	return true
+}
+
+func (h *headersList) Set(value string) error {
+	res := strings.SplitN(value, ":", 2)
+	if len(res) != 2 {
+		return nil
+	}
+	*h = append(*h, header{
+		res[0], strings.Trim(res[1], " "),
+	})
+	return nil
+}
+
 type ipArray []string
 
 func (i *ipArray) String() string {
@@ -269,6 +297,27 @@ func goFun(Url string, postContent string, Referer string, XforwardFor bool, cus
 			request.Header.Add("X-Real-IP", randomip)
 		}
 
+		if len(headers)>0 {
+			for _, head := range headers {
+				headKey := head.key
+				headValue := head.value
+				if strings.HasPrefix(head.key,"Random") {
+					count, convErr := strconv.Atoi(strings.ReplaceAll(head.value, "Random", ""))
+					if convErr==nil {
+						headKey = RandStringBytesMaskImpr(count)
+					}
+				}
+				if strings.HasPrefix(head.value,"Random"){
+					count, convErr := strconv.Atoi(strings.ReplaceAll(head.value, "Random", ""))
+					if convErr==nil {
+						headValue = RandStringBytesMaskImpr(count)
+					}
+				}
+				request.Header.Del(headKey)
+				request.Header.Set(headKey, headValue)
+			}
+		}
+
 		resp, err2 := client.Do(request)
 		if err2 != nil {
 			continue
@@ -287,6 +336,7 @@ var referer = flag.String("r", "", "referer url")
 var xforwardfor = flag.Bool("f", true, "randomized X-Forwarded-For and X-Real-IP address")
 var TerminalWriter = goterminal.New(os.Stdout)
 var customIP ipArray
+var headers headersList
 
 func usage() {
 	fmt.Fprintf(os.Stderr,
@@ -309,6 +359,7 @@ webBenchmark -c 16 -s https://some.website -r https://referer.url
 
 func main() {
 	flag.Var(&customIP, "i", "custom ip address for that domain, multiple addresses automatically will be assigned randomly")
+	flag.Var(&headers, "H", "custom header")
 	flag.Usage = usage
 	flag.Parse()
 	if *h {
