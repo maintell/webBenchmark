@@ -129,7 +129,6 @@ func LeastSquares(x []float64, y []float64) (a float64, b float64) {
 }
 
 func showStat() {
-
 	initialNetCounter, _ := netstat.IOCounters(true)
 	iplist := ""
 	if customIP !=nil && len(customIP)>0{
@@ -181,8 +180,10 @@ func showStat() {
 			//	_, b := LeastSquares(x, y)
 			//	log.Printf("Speed Vertical:%.3f\n", b)
 			//}
-			fmt.Fprintf(TerminalWriter, "Nic:%v,Recv %s/s,Send %s/s\n", netCounter[i].Name,
+			fmt.Fprintf(TerminalWriter, "Nic:%v,Recv %s(%s/s),Send %s(%s/s)\n", netCounter[i].Name,
+				readableBytes(float64(netCounter[i].BytesRecv)),
 				readableBytes(RecvBytes),
+				readableBytes(float64(netCounter[i].BytesSent)),
 				readableBytes(SendBytes))
 		}
 		initialNetCounter = netCounter
@@ -329,8 +330,8 @@ func goFun(Url string, postContent string, Referer string, XforwardFor bool, cus
 	wg.Done()
 }
 var h = flag.Bool("h", false, "this help")
-var count = flag.Int("c", 16, "concurrent thread for download,default 8")
-var url = flag.String("s", "https://baidu.com", "target url")
+var count = flag.Int("c", 16, "concurrent thread for download,default 16")
+var url = flag.String("s", "http://speedtest4.tele2.net/1GB.zip", "target url")
 var postContent = flag.String("p", "", "post content")
 var referer = flag.String("r", "", "referer url")
 var xforwardfor = flag.Bool("f", true, "randomized X-Forwarded-For and X-Real-IP address")
@@ -340,7 +341,7 @@ var headers headersList
 
 func usage() {
 	fmt.Fprintf(os.Stderr,
-`webBenchmark version: /0.4
+`webBenchmark version: /0.5
 Usage: webBenchmark [-c concurrent] [-s target] [-p] [-r refererUrl] [-f] [-i ip]
 
 Options:

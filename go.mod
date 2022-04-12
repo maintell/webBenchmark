@@ -8,6 +8,7 @@ require (
 	github.com/StackExchange/wmi v0.0.0-20210224194228-fe8f1750fd46 // indirect
 	github.com/apoorvam/goterminal v0.0.0-20180523175556-614d345c47e5
 	github.com/go-ole/go-ole v1.2.5 // indirect
+	github.com/liushuochen/gotable v0.0.0-20220408160921-3255800d3de2
 	github.com/mattn/go-isatty v0.0.12 // indirect
 	github.com/miekg/dns v1.1.43
 	github.com/shirou/gopsutil v3.21.4+incompatible
