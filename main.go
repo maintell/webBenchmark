@@ -144,12 +144,12 @@ func showStat() {
 		netCounter, _ := netstat.IOCounters(true)
 		loadStat, _ := load.Avg()
 
-		fmt.Fprintf(TerminalWriter, "target URL:%s\n", *url)
-		fmt.Fprintf(TerminalWriter, "target IP:%s\n", iplist)
+		fmt.Fprintf(TerminalWriter, "URL:%s\n", *url)
+		fmt.Fprintf(TerminalWriter, "IP:%s\n", iplist)
 
-		fmt.Fprintf(TerminalWriter, "cpu percent:%.3f%% \n", percent)
-		fmt.Fprintf(TerminalWriter, "mem percent:%.3f%% \n", memStat.UsedPercent)
-		fmt.Fprintf(TerminalWriter, "load info:%.3f %.3f %.3f\n", loadStat.Load1, loadStat.Load5, loadStat.Load15)
+		fmt.Fprintf(TerminalWriter, "CPU:%.3f%% \n", percent)
+		fmt.Fprintf(TerminalWriter, "Memory:%.3f%% \n", memStat.UsedPercent)
+		fmt.Fprintf(TerminalWriter, "Load:%.3f %.3f %.3f\n", loadStat.Load1, loadStat.Load5, loadStat.Load15)
 		for i := 0; i < len(netCounter); i++ {
 			if netCounter[i].BytesRecv == 0 && netCounter[i].BytesSent == 0 {
 				continue
@@ -341,7 +341,7 @@ var headers headersList
 
 func usage() {
 	fmt.Fprintf(os.Stderr,
-`webBenchmark version: /0.5
+`webBenchmark version: /0.6
 Usage: webBenchmark [-c concurrent] [-s target] [-p] [-r refererUrl] [-f] [-i ip]
 
 Options:
