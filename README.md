@@ -50,6 +50,10 @@ Current version: 0.10 — see [CHANGELOG.md](CHANGELOG.md) for what changed.
           spoof the whole set of proxy headers with a random client address on every
           request; use it to check whether your own rate limits can be bypassed by a
           forged address
+    -proto string
+          protocol to benchmark with: http1, http2 or http3 (default "http1")
+    -noprobe
+          skip the startup protocol probe (it costs one extra request)
     -fc string
           country code used to pick X-Forwarded-For addresses (default "cn")
     -d
@@ -94,6 +98,31 @@ Asset names:
     ./webBenchmark_linux_x64 -s https://target.url -nr
 
 ## Behaviour notes
+
+- **Which protocol is actually in use?** `-proto` picks `http1` (default), `http2` or
+  `http3`, and the startup probe prints what the server really offers:
+
+  ```
+  probe: alpn=h2 alt-svc=none -> server supports http2 only (-proto http2)
+  probe: alpn=h2 alt-svc=h3=":443"; ma=86400 -> server advertises http3 (-proto http3)
+  ```
+
+  The verdict comes from two independent signals. ALPN tells you whether HTTP/2 can be
+  negotiated. HTTP/3 is **not** negotiated by ALPN — the only standard way to discover it
+  is an `Alt-Svc` header carrying `h3`, so a missing `Alt-Svc` means "this server does not
+  offer h3", not "the probe failed". Two real examples: a bare nginx answered `alpn=h2`
+  with no `Alt-Svc`, so h3 is unavailable there; `www.cloudflare.com` answered `alpn=h2`
+  plus `alt-svc: h3=":443"`, and `-proto http3` then completed 221 requests over QUIC.
+
+  HTTP/2 has to be asked for explicitly. Go disables it whenever a custom `TLSClientConfig`
+  or `DialContext` is supplied, which this tool needs for `-i` and the address family
+  filter, so `-proto http2` sets `ForceAttemptHTTP2`. HTTP/3 goes over QUIC, which the Go
+  standard library does not implement at all; it is provided by `quic-go`, and `-i` / `-4`
+  / `-6` still apply through a QUIC dial hook.
+
+  Note that multiplexing is not automatically faster: against a target that caps each
+  client address, one h2 connection is just as BDP limited as one h1 connection. Measured
+  on the same host: 508 KB/s with eight http1 connections versus 460 KB/s with http2.
 
 - **Auto ramp (default).** Without `-c` the tool starts at 4 connections, measures a
   4 second window, and doubles whenever throughput beats the best result so far by more

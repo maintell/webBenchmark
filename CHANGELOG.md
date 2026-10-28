@@ -91,6 +91,24 @@ covered by regression tests in `*_test.go`.
 
 ### Added
 
+- **`-proto http1|http2|http3` and a startup capability probe.** The probe makes one plain
+  request and reports the negotiated ALPN plus the `Alt-Svc` header, which is what actually
+  answers "does this server do HTTP/3":
+  `alpn=h2 alt-svc=none -> server supports http2 only`, or
+  `alpn=h2 alt-svc=h3=":443"; ma=86400 -> server advertises http3`. HTTP/3 is never
+  negotiated through ALPN, so a missing `Alt-Svc` is the answer, not a probe failure.
+- **HTTP/2 support.** Go silently disables h2 as soon as a custom `TLSClientConfig` or
+  `DialContext` is set — which this tool needs — so `-proto http2` sets
+  `ForceAttemptHTTP2`. It is opt in because it changes what is being measured: on a target
+  that caps each client address, eight h1 connections reached 508 KB/s while h2 reached
+  460 KB/s.
+- **HTTP/3 over QUIC** via `quic-go`, including `-i` and `-4`/`-6` through a QUIC dial hook.
+  Validated against a server that advertises h3: 221 requests completed over QUIC. Against
+  a server that does not, the probe now warns up front instead of leaving the user staring
+  at timeouts.
+- **A 1xx response is no longer counted as a completed request.** The h3 client surfaces
+  `103 Early Hints` as the final response, which made a real run report 25 successful
+  requests with 0 bytes loaded. It now counts as a failure with a clear reason.
 - **`-px` — spoof the full set of proxy headers.** Every request carries a fresh forged
   client address in `X-Forwarded-For`, `X-Real-IP`, `X-Client-IP`, `True-Client-IP`,
   `CF-Connecting-IP`, `Fastly-Client-IP`, `X-Cluster-Client-IP`, `X-Originating-IP`,
@@ -134,6 +152,8 @@ covered by regression tests in `*_test.go`.
 
 ### Changed
 
+- Adds `github.com/quic-go/quic-go` (pinned to v0.42.0) for HTTP/3. The module stays on
+  Go 1.21; newer quic-go releases would push the floor to 1.26.
 - Terminal output now writes explicit `\r\n`. Reading keys requires raw mode, which turns
   off the terminal's newline translation; without this the status bar would staircase.
 - Adds `golang.org/x/term` (pinned to a Go 1.21 compatible release) for portable raw mode.

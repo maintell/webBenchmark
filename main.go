@@ -37,6 +37,7 @@ type benchOptions struct {
 	family      ipFamily
 	gate        *limiter
 	proxySpoof  bool
+	proto       protoMode
 }
 
 var (
@@ -56,6 +57,8 @@ var (
 	requestTimeout  = flag.Int("t", 30, "per-request timeout in seconds, 0 means no timeout")
 	forceIPv4       = flag.Bool("4", false, "force IPv4 only; this is the default")
 	forceIPv6       = flag.Bool("6", false, "force IPv6 only instead of the default IPv4")
+	protoFlag       = flag.String("proto", "http1", "protocol to benchmark with: http1, http2 or http3 (http3 needs the server to support QUIC)")
+	noProbe         = flag.Bool("noprobe", false, "skip the startup protocol capability probe")
 	dnsServer       = flag.String("dns", "8.8.8.8", "dns server used for the target ip display")
 	TerminalWriter  = goterminal.New(os.Stdout)
 	customIP        ipArray
@@ -196,14 +199,20 @@ func dialFamily(ctx context.Context, dialer *net.Dialer, network, host, port str
 var sharedSessionCache = tls.NewLRUClientSessionCache(256)
 
 // newTransport 每个 goroutine 独占一个 Transport，连接池互不干扰。
-// 以前 Transport 建在 for 循环里，每个请求都要重新握手，连接池等于不存在。
-func newTransport(opts *benchOptions) *http.Transport {
+// HTTP/2 需要显式 ForceAttemptHTTP2：一旦设置了 TLSClientConfig 或 DialContext，
+// Go 会保守地把 h2 关掉，那样永远只能测到 HTTP/1.1。
+func newTransport(opts *benchOptions) roundTripperCloser {
+	if opts.proto == protoHTTP3 {
+		return newH3Transport(opts)
+	}
+
 	tr := &http.Transport{
 		// 压测对象常常是裸 IP 或自签证书，证书链校验在这里没有意义。
 		TLSClientConfig: &tls.Config{
 			InsecureSkipVerify: true,
 			ClientSessionCache: sharedSessionCache,
 		},
+		ForceAttemptHTTP2:   opts.proto == protoHTTP2,
 		DisableKeepAlives:   opts.noReuse,
 		MaxIdleConns:        256,
 		MaxIdleConnsPerHost: 256,
@@ -305,6 +314,16 @@ func sendOnce(ctx context.Context, client *http.Client, opts *benchOptions, targ
 		}
 		stats.failed.Add(1)
 		reportError(err)
+		return false
+	}
+
+	// quic-go 的 HTTP/3 客户端会把 1xx（例如 Cloudflare 的 103 Early Hints）
+	// 当作最终响应返回，若直接计数会把吞吐算成 0，这里显式拦掉。
+	if resp.StatusCode < http.StatusOK {
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+		stats.failed.Add(1)
+		reportError(fmt.Errorf("got informational status %d instead of a final response", resp.StatusCode))
 		return false
 	}
 
@@ -436,6 +455,10 @@ Examples:
       benchmark https://some.website with a custom referer
   webBenchmark -c 16 -s https://some.website -H 'regid:123' -H 'sign:Random16'
       attach a fixed regid header and a 16 letter random sign header
+  webBenchmark -s https://some.website -proto http3
+      benchmark over QUIC, for servers that advertise http3 via Alt-Svc
+  webBenchmark -s https://some.website -noprobe
+      skip the startup protocol probe (it costs one extra request)
 
 `)
 }
@@ -552,6 +575,12 @@ func main() {
 		os.Exit(2)
 	}
 
+	mode, err := parseProto(*protoFlag)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "webBenchmark: %v\n", err)
+		os.Exit(2)
+	}
+
 	target, err := resolveTarget()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "webBenchmark: %v\n", err)
@@ -562,6 +591,17 @@ func main() {
 		os.Exit(2)
 	}
 	setTargetURL(target)
+
+	// 一次普通请求就能回答"这台服务器支持到哪一层协议"，而且不污染压测计数。
+	if !*noProbe {
+		report, advertisesH3 := probeProtocol(target)
+		fmt.Fprintf(os.Stderr, "probe: %s\n", report)
+		if mode == protoHTTP3 && !advertisesH3 {
+			// h3 只会通过 Alt-Svc 宣告；没有宣告时 QUIC 多半被挡或没开，
+			// 提前说清楚，免得用户只看到一片超时。
+			fmt.Fprintln(os.Stderr, "warning: the target does not advertise http3 via Alt-Svc, QUIC is probably blocked or not enabled")
+		}
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -589,6 +629,7 @@ func main() {
 		timeout:     time.Duration(*requestTimeout) * time.Second,
 		family:      selectedFamily(),
 		proxySpoof:  *proxySpoof,
+		proto:       mode,
 	}
 
 	var wg sync.WaitGroup
