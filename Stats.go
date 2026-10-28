@@ -67,6 +67,18 @@ func showStat(ctx context.Context) {
 		if ipList != "" {
 			fmt.Fprintf(TerminalWriter, "IP:%s\n", ipList)
 		}
+
+		isAuto, level, phase, best, bestConc, steps := modeSnapshot()
+		if isAuto {
+			if phase == "settled" && best > 0 {
+				fmt.Fprintf(TerminalWriter, "Mode:auto  Phase:settled  Conc:%d  Peak:%s/s@%d\n",
+					level, readableBytes(best), bestConc)
+			} else {
+				fmt.Fprintf(TerminalWriter, "Mode:auto  Phase:%s  Conc:%d\n", phase, level)
+			}
+		} else {
+			fmt.Fprintf(TerminalWriter, "Mode:fixed  Conc:%d\n", level)
+		}
 		loaded := stats.bytes.Load()
 		elapsed := time.Since(started).Seconds()
 		var avg float64
@@ -78,6 +90,31 @@ func showStat(ctx context.Context) {
 			readableBytes(float64(loaded)), readableBytes(avg), int(elapsed))
 		if msg := lastErrorMessage(); msg != "" {
 			fmt.Fprintf(TerminalWriter, "LastError:%s\n", shortText(msg, 110))
+		}
+
+		if len(steps) > 0 {
+			fmt.Fprintf(TerminalWriter, "Ramp:")
+			if len(steps) > autoVisibleSteps {
+				steps = steps[len(steps)-autoVisibleSteps:]
+			}
+			for i, s := range steps {
+				change := ""
+				if s.hasGain {
+					change = fmt.Sprintf("%+6.1f%%", s.gain*100)
+				} else {
+					change = "      -"
+				}
+				mark := ""
+				if i == len(steps)-1 && phase == "settled" {
+					mark = "  <- plateau"
+				}
+				if s.failed > 0 {
+					mark = fmt.Sprintf("  [failed:%d]", s.failed)
+				}
+				fmt.Fprintf(TerminalWriter, "\n  conc=%-4d %10s/s %s%s",
+					s.conc, readableBytes(s.rate), change, mark)
+			}
+			fmt.Fprintf(TerminalWriter, "\n")
 		}
 		fmt.Fprintf(TerminalWriter, "CPU:%.2f%% \n", firstPercent(percent))
 		if memStat != nil {

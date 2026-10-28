@@ -35,11 +35,12 @@ type benchOptions struct {
 	noReuse     bool
 	timeout     time.Duration
 	family      ipFamily
+	gate        *limiter
 }
 
 var (
 	h               = flag.Bool("h", false, "show this help")
-	count           = flag.Int("c", 16, "concurrent routines")
+	count           = flag.Int("c", 0, "concurrent routines; omit or 0 to ramp up automatically until throughput stops improving")
 	targetInput     = flag.String("s", "", "target url")
 	postContent     = flag.String("p", "", "post content")
 	randomPost      = flag.Bool("rp", false, "send random post content on every request")
@@ -187,7 +188,14 @@ func runBenchmark(ctx context.Context, opts *benchOptions, target func() string)
 			continue
 		}
 
-		if !sendOnce(ctx, client, opts, current) {
+		// 自动模式下闸门可以动态收放；固定模式 opts.gate 为 nil，等于没有限制。
+		if !opts.gate.Acquire() {
+			return
+		}
+		ok := sendOnce(ctx, client, opts, current)
+		opts.gate.Release()
+
+		if !ok {
 			// 失败时退让一下，避免变成满核空转的忙循环。
 			if !waitOrDone(ctx, 10*time.Millisecond) {
 				return
@@ -350,8 +358,10 @@ Options:
 	flag.PrintDefaults()
 	fmt.Fprintf(os.Stderr, `
 Examples:
+  webBenchmark -s https://some.website
+      auto ramp: raise concurrency until throughput stops improving, then hold it
   webBenchmark -c 16 -s https://some.website
-      benchmark https://some.website using system dns
+      fixed 16 concurrent requests
   webBenchmark -c 16 -s https://some.website -i 10.0.0.1 -i 10.0.0.2
       same, but dial 10.0.0.1 and 10.0.0.2 at random instead of resolving dns
   webBenchmark -c 16 -s https://some.website -r https://referer.url
@@ -360,6 +370,14 @@ Examples:
       attach a fixed regid header and a 16 letter random sign header
 
 `)
+}
+
+// autoConcurrency 判断本次是否进入自动模式。
+//
+// 默认值就是 0，所以"没写 -c"和"写了 -c 0"是同一个意思：让工具自己去探吞吐上限。
+// 只有明确给出正数才按固定并发跑。
+func autoConcurrency() bool {
+	return *count <= 0
 }
 
 // selectedFamily 返回本次要使用的地址族。
@@ -491,14 +509,6 @@ func main() {
 		go preloadCountryCIDR(*xforwardCountry)
 	}
 
-	routines := *count
-	if len(customIP) > 0 && routines < len(customIP) {
-		routines = len(customIP)
-	}
-	if routines <= 0 {
-		routines = 16
-	}
-
 	opts := &benchOptions{
 		postContent: *postContent,
 		randomPost:  *randomPost,
@@ -520,12 +530,30 @@ func main() {
 		showStat(ctx)
 	}()
 
-	for i := 0; i < routines; i++ {
+	if autoConcurrency() {
+		// 没给 -c 就自己找上限：从小并发起步，逐级提升到吞吐不再增长。
+		start := autoStartConcurrency
+		if len(customIP) > start {
+			start = len(customIP)
+		}
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			runBenchmark(ctx, opts, getTargetURL)
+			runAutoRamp(ctx, opts, &wg, start)
 		}()
+	} else {
+		routines := *count
+		if len(customIP) > 0 && routines < len(customIP) {
+			routines = len(customIP)
+		}
+		setFixedConcurrency(routines)
+		for i := 0; i < routines; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				runBenchmark(ctx, opts, getTargetURL)
+			}()
+		}
 	}
 
 	wg.Wait()

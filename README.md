@@ -9,6 +9,8 @@ Current version: 0.10 — see [CHANGELOG.md](CHANGELOG.md) for what changed.
 - customizable Referer Url,
 - customizable header,
 - concurrent routines as you wish, depends on you server performance.
+- **omitting `-c` ramps concurrency up automatically** until throughput stops improving,
+  then settles on the measured best value instead of a fixed guess.
 - http post mode, with optional random payload size
 - specify multi target ip, or resolved by system dns.
 - randomly X-Forwarded-For and X-Real-IP (default on), picking addresses from a per-country CIDR list with a local fallback when the list is unreachable.
@@ -22,9 +24,10 @@ Current version: 0.10 — see [CHANGELOG.md](CHANGELOG.md) for what changed.
 - automatically tune concurrent routines to gain maximum performance. 
 
 # Usage
+    webBenchmark -s [URL]                   auto ramp (no -c)
     webBenchmark -c [COUNT] -s [URL] -r [REFERER]
     -c int
-          concurrent routines (default 16)
+          concurrent routines; omit or 0 to ramp up automatically until throughput stops improving
     -s string
           target url, must start with http:// or https://
     -r string
@@ -87,6 +90,26 @@ Asset names:
     ./webBenchmark_linux_x64 -s https://target.url -nr
 
 ## Behaviour notes
+
+- **Auto ramp (default).** Without `-c` the tool starts at 4 connections, measures a
+  4 second window, and doubles whenever throughput beats the best result so far by more
+  than 10%. It stops after two consecutive windows without such a gain and then holds the
+  concurrency that actually produced the **best** result — not the last one it tried, so a
+  probe that overshoots does not leave you running at a worse setting. A window containing
+  failures is never treated as an improvement. The progress is written to stderr once and
+  stays visible in the status bar:
+
+  ```
+  Mode:auto  Phase:settled  Conc:8  Peak:568.000KB/s@8
+  Ramp:
+    conc=4     480.000KB/s       -
+    conc=8     528.000KB/s  +10.0%
+    conc=8     568.000KB/s   +7.6%  <- plateau
+  ```
+
+  Comparisons are made against the historical peak rather than the previous window,
+  because a single 4 second window on a long haul link can swing by 30%. Pass `-c N` for
+  a fixed level when you already know what you want.
 
 - **Connection reuse.** By default every routine keeps one persistent connection and
   reuses it, which measures application level throughput. `-nr` disables keep-alive so

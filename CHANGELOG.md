@@ -91,6 +91,13 @@ covered by regression tests in `*_test.go`.
 
 ### Added
 
+- **Auto ramp when `-c` is omitted.** Starts at 4 connections, measures 4 second windows
+  and doubles while throughput beats the best result so far by more than 10%, then settles
+  on the concurrency that produced that best result. A resizable gate lets it step back
+  down, so an overshooting probe does not leave the run on a worse setting; windows
+  containing failures never count as an improvement. Measured on a long haul link the ramp
+  settled at 8 connections / 568 KB/s after the naive "last tried" version had walked up
+  to 64 and stayed at 400 KB/s.
 - `-nr` — open a new TCP connection per request.
 - `-t` — per-request timeout in seconds (default 30, `0` disables it).
 - `-4` / `-6` — pin the address family. IPv4 is the default; `-6` is an explicit opt in.
@@ -103,6 +110,8 @@ covered by regression tests in `*_test.go`.
 
 ### Changed
 
+- **`-c` is now optional and defaults to auto.** Leaving it out (or passing `-c 0`) enables
+  the auto ramp described above; a positive value keeps the old fixed concurrency.
 - **The default address family is now IPv4.** A benchmark result must not depend on which
   family the resolver happened to prefer; pass `-6` when you actually want to exercise
   IPv6.
