@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -32,11 +33,10 @@ type rampStep struct {
 	failed  uint64
 }
 
-// limiter 是可动态缩小的并发闸门。
+// limiter 是可动态缩放的并发闸门。
 //
-// 自动模式只会不断新增 worker（保持连接热着，不重建握手），
-// 但"能加到多少"和"该停在多少"是两件事：实测峰值出现在 32 并发，
-// 探到 64 才发现没更好，这时必须能退回 32，否则会一直跑在次优并发上。
+// worker 只增不减（保持连接热着，不重建握手），但"能加到多少"和"该停在多少"
+// 是两件事：实测峰值出现在 32 并发，探到 64 才发现没更好，这时必须能退回 32。
 // 多出来的 worker 只是阻塞在闸门上，不会占连接。
 type limiter struct {
 	mu     sync.Mutex
@@ -95,15 +95,26 @@ func (l *limiter) SetLimit(n int) {
 	l.cond.Broadcast()
 }
 
+func (l *limiter) Limit() int {
+	if l == nil {
+		return 0
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.limit
+}
+
 var (
 	autoMu       sync.Mutex
 	autoOn       bool
 	autoLevel    int
 	autoPhase    string
+	autoNote     string
 	autoBest     float64
 	autoBestConc int
 	autoSteps    []rampStep
 	fixedLevel   int
+	interactive  bool
 )
 
 func setAutoState(level int, phase string) {
@@ -112,6 +123,12 @@ func setAutoState(level int, phase string) {
 	autoOn = true
 	autoLevel = level
 	autoPhase = phase
+}
+
+func setAutoNote(note string) {
+	autoMu.Lock()
+	defer autoMu.Unlock()
+	autoNote = note
 }
 
 func setAutoPeak(rate float64, conc int) {
@@ -127,6 +144,12 @@ func setFixedConcurrency(n int) {
 	fixedLevel = n
 }
 
+func setInteractive(on bool) {
+	autoMu.Lock()
+	defer autoMu.Unlock()
+	interactive = on
+}
+
 func recordStep(step rampStep) {
 	autoMu.Lock()
 	defer autoMu.Unlock()
@@ -136,15 +159,100 @@ func recordStep(step rampStep) {
 	}
 }
 
+type modeView struct {
+	isAuto bool
+	level  int
+	phase  string
+	note   string
+	best   float64
+	peakAt int
+	steps  []rampStep
+	canKey bool
+}
+
 // modeSnapshot 供状态栏渲染，返回值都是拷贝，避免渲染时持锁。
-func modeSnapshot() (isAuto bool, level int, phase string, best float64, bestConc int, steps []rampStep) {
+func modeSnapshot() modeView {
 	autoMu.Lock()
 	defer autoMu.Unlock()
 	if !autoOn {
-		return false, fixedLevel, "fixed", 0, 0, nil
+		return modeView{level: fixedLevel, phase: "fixed", canKey: interactive}
 	}
-	steps = append(steps, autoSteps...)
-	return true, autoLevel, autoPhase, autoBest, autoBestConc, steps
+	return modeView{
+		isAuto: true,
+		level:  autoLevel,
+		phase:  autoPhase,
+		note:   autoNote,
+		best:   autoBest,
+		peakAt: autoBestConc,
+		steps:  append([]rampStep(nil), autoSteps...),
+		canKey: interactive,
+	}
+}
+
+// autoRamp 负责按需增加 worker，并把闸门调到目标并发。
+type autoRamp struct {
+	ctx  context.Context
+	opts *benchOptions
+	wg   *sync.WaitGroup
+	gate *limiter
+
+	mu      sync.Mutex
+	spawned int
+	manual  bool
+}
+
+var activeRamp atomic.Pointer[autoRamp]
+
+func newAutoRamp(ctx context.Context, opts *benchOptions, wg *sync.WaitGroup, start int) *autoRamp {
+	return &autoRamp{
+		ctx:  ctx,
+		opts: opts,
+		wg:   wg,
+		gate: newLimiter(ctx, start),
+	}
+}
+
+// setConcurrency 把有效并发调到 n：worker 不够就补，闸门同步收紧或放宽。
+func (r *autoRamp) setConcurrency(n int) {
+	if n < 1 {
+		n = 1
+	}
+	if n > autoMaxConcurrency {
+		n = autoMaxConcurrency
+	}
+	r.mu.Lock()
+	for r.spawned < n {
+		r.spawned++
+		r.wg.Add(1)
+		go func() {
+			defer r.wg.Done()
+			runBenchmark(r.ctx, r.opts, getTargetURL)
+		}()
+	}
+	r.mu.Unlock()
+	r.gate.SetLimit(n)
+}
+
+func (r *autoRamp) isManual() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.manual
+}
+
+// Adjust 处理用户按下的扩容/缩容键，并停止自动判定。
+func (r *autoRamp) Adjust(factor float64, label string) {
+	if r.ctx.Err() != nil {
+		return
+	}
+	next := scaledConcurrency(r.gate.Limit(), factor)
+
+	r.mu.Lock()
+	r.manual = true
+	r.mu.Unlock()
+
+	r.setConcurrency(next)
+	setAutoState(next, "manual")
+	setAutoNote("user " + label)
 }
 
 // decideRamp 决定下一步：提升并发、原地再测一次、还是收敛。
@@ -185,37 +293,36 @@ func decideRamp(current, maxConc int, best, rate float64, flat int,
 
 // runAutoRamp 逐级提升并发直到吞吐不再超过历史峰值。
 func runAutoRamp(ctx context.Context, opts *benchOptions, wg *sync.WaitGroup, start int) {
-	spawn := func(n int) {
-		for i := 0; i < n; i++ {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				runBenchmark(ctx, opts, getTargetURL)
-			}()
-		}
+	if start < 1 {
+		start = autoStartConcurrency
+	}
+	if start > autoMaxConcurrency {
+		start = autoMaxConcurrency
 	}
 
-	current := start
-	if current < 1 {
-		current = autoStartConcurrency
-	}
-	if current > autoMaxConcurrency {
-		current = autoMaxConcurrency
-	}
+	ramp := newAutoRamp(ctx, opts, wg, start)
+	opts.gate = ramp.gate
+	// 这里刻意不在退出时清空 activeRamp：
+	// 用户手动接管后自动判定会停，但按键必须继续有效，
+	// 否则第二次按键就落空了。ctx 结束后 Adjust 自己会忽略输入。
+	activeRamp.Store(ramp)
 
-	// 闸门先按起始并发卡住，之后既能放大也能缩回最优值。
-	opts.gate = newLimiter(ctx, current)
-	spawn(current)
-	setAutoState(current, "ramping")
+	ramp.setConcurrency(start)
+	setAutoState(start, "ramping")
 
 	prevBytes := stats.bytes.Load()
 	prevFailed := stats.failed.Load()
 	flat := 0
 	best := 0.0
-	bestConc := current
+	bestConc := start
+	current := start
 
 	for {
 		if !waitOrDone(ctx, autoWindow) {
+			return
+		}
+		// 用户已经手动接管，自动判定就此停止，不再和用户抢控制权。
+		if ramp.isManual() {
 			return
 		}
 
@@ -243,7 +350,7 @@ func runAutoRamp(ctx context.Context, opts *benchOptions, wg *sync.WaitGroup, st
 
 		if settle {
 			// 收敛到实测最优点，而不是最后试到的那个并发。
-			opts.gate.SetLimit(bestConc)
+			ramp.setConcurrency(bestConc)
 			setAutoState(bestConc, "settled")
 			setAutoPeak(best, bestConc)
 			fmt.Fprintf(os.Stderr, "auto: settled at %d connections, peak %s/s\n",
@@ -252,9 +359,8 @@ func runAutoRamp(ctx context.Context, opts *benchOptions, wg *sync.WaitGroup, st
 		}
 
 		if next > current {
-			spawn(next - current)
 			current = next
-			opts.gate.SetLimit(current)
+			ramp.setConcurrency(current)
 			setAutoState(current, "ramping")
 		}
 	}

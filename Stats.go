@@ -5,8 +5,10 @@ import (
 	"fmt"
 	"math"
 	URL "net/url"
+	"os"
 	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -24,6 +26,42 @@ type requestStats struct {
 }
 
 var stats requestStats
+
+// 失败原因以前只进计数器，用户看到 Failed 在涨却不知道原因
+// （比如用 -6 去测一个只有 IPv4 的目标）。这里把每种错误打印一次，
+// 并把最后一条挂到状态栏上。
+var (
+	errMu     sync.Mutex
+	seenError = make(map[string]struct{})
+	lastError string
+)
+
+const maxDistinctErrors = 20
+
+func reportError(err error) {
+	if err == nil {
+		return
+	}
+	msg := err.Error()
+
+	errMu.Lock()
+	_, seen := seenError[msg]
+	if !seen && len(seenError) < maxDistinctErrors {
+		seenError[msg] = struct{}{}
+	}
+	lastError = msg
+	errMu.Unlock()
+
+	if !seen {
+		fmt.Fprintf(os.Stderr, "error: %s\n", msg)
+	}
+}
+
+func lastErrorMessage() string {
+	errMu.Lock()
+	defer errMu.Unlock()
+	return lastError
+}
 
 type netCounters struct {
 	recv, sent uint64
@@ -51,6 +89,12 @@ func showStat(ctx context.Context) {
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 
+	// raw 模式下终端的 OPOST 会被关掉，"\n" 不再自动补回车，
+	// 所以这里统一显式写 "\r\n"，有没有 OPOST 都不会出现阶梯错位。
+	line := func(format string, args ...interface{}) {
+		fmt.Fprintf(TerminalWriter, format+"\r\n", args...)
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -63,65 +107,70 @@ func showStat(ctx context.Context) {
 		loadStat, _ := load.Avg()
 		cur := snapshotNetCounters()
 
-		fmt.Fprintf(TerminalWriter, "URL:%s\n", getTargetURL())
+		line("URL:%s", getTargetURL())
 		if ipList != "" {
-			fmt.Fprintf(TerminalWriter, "IP:%s\n", ipList)
+			line("IP:%s", ipList)
 		}
 
-		isAuto, level, phase, best, bestConc, steps := modeSnapshot()
-		if isAuto {
-			if phase == "settled" && best > 0 {
-				fmt.Fprintf(TerminalWriter, "Mode:auto  Phase:settled  Conc:%d  Peak:%s/s@%d\n",
-					level, readableBytes(best), bestConc)
-			} else {
-				fmt.Fprintf(TerminalWriter, "Mode:auto  Phase:%s  Conc:%d\n", phase, level)
-			}
-		} else {
-			fmt.Fprintf(TerminalWriter, "Mode:fixed  Conc:%d\n", level)
+		view := modeSnapshot()
+		switch {
+		case !view.isAuto:
+			line("Mode:fixed  Conc:%d", view.level)
+		case view.phase == "settled" && view.best > 0:
+			line("Mode:auto  Phase:settled  Conc:%d  Peak:%s/s@%d",
+				view.level, readableBytes(view.best), view.peakAt)
+		case view.note != "":
+			line("Mode:auto  Phase:%s  Conc:%d  (%s)", view.phase, view.level, view.note)
+		default:
+			line("Mode:auto  Phase:%s  Conc:%d", view.phase, view.level)
 		}
+
 		loaded := stats.bytes.Load()
 		elapsed := time.Since(started).Seconds()
 		var avg float64
 		if elapsed > 0 {
 			avg = float64(loaded) / elapsed
 		}
-		fmt.Fprintf(TerminalWriter, "Requests:%d  Failed:%d  Loaded:%s  Avg:%s/s  Elapsed:%ds\n",
+		line("Requests:%d  Failed:%d  Loaded:%s  Avg:%s/s  Elapsed:%ds",
 			stats.requests.Load(), stats.failed.Load(),
 			readableBytes(float64(loaded)), readableBytes(avg), int(elapsed))
+
 		if msg := lastErrorMessage(); msg != "" {
-			fmt.Fprintf(TerminalWriter, "LastError:%s\n", shortText(msg, 110))
+			line("LastError:%s", shortText(msg, 110))
 		}
 
-		if len(steps) > 0 {
-			fmt.Fprintf(TerminalWriter, "Ramp:")
+		if view.canKey {
+			line("Keys:%s", concurrencyLegend())
+		}
+
+		if len(view.steps) > 0 {
+			line("Ramp:")
+			steps := view.steps
 			if len(steps) > autoVisibleSteps {
 				steps = steps[len(steps)-autoVisibleSteps:]
 			}
 			for i, s := range steps {
-				change := ""
+				change := "      -"
 				if s.hasGain {
 					change = fmt.Sprintf("%+6.1f%%", s.gain*100)
-				} else {
-					change = "      -"
 				}
 				mark := ""
-				if i == len(steps)-1 && phase == "settled" {
+				if i == len(steps)-1 && view.phase == "settled" {
 					mark = "  <- plateau"
 				}
 				if s.failed > 0 {
 					mark = fmt.Sprintf("  [failed:%d]", s.failed)
 				}
-				fmt.Fprintf(TerminalWriter, "\n  conc=%-4d %10s/s %s%s",
-					s.conc, readableBytes(s.rate), change, mark)
+				line("  conc=%-4d %10s/s %s%s", s.conc, readableBytes(s.rate), change, mark)
 			}
-			fmt.Fprintf(TerminalWriter, "\n")
 		}
-		fmt.Fprintf(TerminalWriter, "CPU:%.2f%% \n", firstPercent(percent))
+
+		line("CPU:%.2f%% ", firstPercent(percent))
 		if memStat != nil {
-			fmt.Fprintf(TerminalWriter, "Memory:%.3f%% \n", memStat.UsedPercent)
+			line("Memory:%.3f%% ", memStat.UsedPercent)
 		}
 		if loadStat != nil {
-			fmt.Fprintf(TerminalWriter, "Load:%.3f %.3f %.3f\n", loadStat.Load1, loadStat.Load5, loadStat.Load15)
+			line("Load:%.3f %.3f %.3f", loadStat.Load1, loadStat.Load5, loadStat.Load15)
 		}
 		for _, name := range sortedNames(cur) {
 			c := cur[name]
@@ -133,7 +182,7 @@ func showStat(ctx context.Context) {
 				recvRate = c.recv - p.recv
 				sentRate = c.sent - p.sent
 			}
-			fmt.Fprintf(TerminalWriter, "Nic:%v,Recv %s(%s/s),Send %s(%s/s)\n", name,
+			line("Nic:%v,Recv %s(%s/s),Send %s(%s/s)", name,
 				readableBytes(float64(c.recv)),
 				readableBytes(float64(recvRate)),
 				readableBytes(float64(c.sent)),
@@ -173,7 +222,7 @@ func sortedNames(counters map[string]netCounters) []string {
 }
 
 // resolveTargetIPs 返回用于展示的目标地址：指定了 -i 就展示这些 IP，
-// 否则对当前目标做一次 A 记录查询。-sub 模式下也能拿到正确的域名。
+// 否则对当前目标做一次地址查询，记录类型跟随地址族。
 func resolveTargetIPs() string {
 	if len(customIP) > 0 {
 		return customIP.String()

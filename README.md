@@ -111,6 +111,21 @@ Asset names:
   because a single 4 second window on a long haul link can swing by 30%. Pass `-c N` for
   a fixed level when you already know what you want.
 
+- **Live concurrency keys (auto mode, interactive terminal only).** While the run is in
+  progress you can steer the concurrency without restarting:
+
+  | key | effect | key | effect |
+  | --- | --- | --- | --- |
+  | `1` | +10% | `5` | −10% |
+  | `2` | +20% | `6` | −20% |
+  | `3` | +30% | `7` | −30% |
+  | `4` | ×2 | `8` | ÷2 |
+
+  The first key press takes control: automatic ramping stops, the phase switches to
+  `manual`, and the status bar shows what you pressed (`Conc:14  (user -30%)`). Further
+  presses keep working. `Ctrl+C` still exits. Keys need a real terminal — when stdin is
+  redirected the `Keys:` line is omitted and everything else behaves the same.
+
 - **Connection reuse.** By default every routine keeps one persistent connection and
   reuses it, which measures application level throughput. `-nr` disables keep-alive so
   each request pays a full TCP (and TLS) handshake; use it to measure handshake overhead

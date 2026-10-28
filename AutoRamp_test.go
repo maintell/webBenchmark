@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -222,15 +223,15 @@ func TestModeSnapshotDefaultsToFixed(t *testing.T) {
 	autoMu.Unlock()
 
 	setFixedConcurrency(12)
-	isAuto, level, phase, best, _, steps := modeSnapshot()
-	if isAuto {
+	view := modeSnapshot()
+	if view.isAuto {
 		t.Fatal("expected fixed mode")
 	}
-	if level != 12 || phase != "fixed" {
-		t.Fatalf("unexpected snapshot: level=%d phase=%q", level, phase)
+	if view.level != 12 || view.phase != "fixed" {
+		t.Fatalf("unexpected snapshot: level=%d phase=%q", view.level, view.phase)
 	}
-	if best != 0 || len(steps) != 0 {
-		t.Fatalf("fixed mode should have no peak or steps: best=%v steps=%d", best, len(steps))
+	if view.best != 0 || len(view.steps) != 0 {
+		t.Fatalf("fixed mode should have no peak or steps: best=%v steps=%d", view.best, len(view.steps))
 	}
 }
 
@@ -239,29 +240,137 @@ func TestModeSnapshotAuto(t *testing.T) {
 	autoOn = false
 	fixedLevel = 0
 	autoSteps = nil
+	autoNote = ""
 	autoMu.Unlock()
 
 	setAutoState(8, "ramping")
 	recordStep(rampStep{conc: 4, rate: 1000})
 	setAutoPeak(2000, 8)
 
-	isAuto, level, phase, best, bestConc, steps := modeSnapshot()
-	if !isAuto {
+	view := modeSnapshot()
+	if !view.isAuto {
 		t.Fatal("expected auto mode")
 	}
-	if level != 8 || phase != "ramping" {
-		t.Fatalf("unexpected snapshot: level=%d phase=%q", level, phase)
+	if view.level != 8 || view.phase != "ramping" {
+		t.Fatalf("unexpected snapshot: level=%d phase=%q", view.level, view.phase)
 	}
-	if best != 2000 || bestConc != 8 {
-		t.Fatalf("unexpected peak: %v @ %d", best, bestConc)
+	if view.best != 2000 || view.peakAt != 8 {
+		t.Fatalf("unexpected peak: %v @ %d", view.best, view.peakAt)
 	}
-	if len(steps) != 1 || steps[0].conc != 4 {
-		t.Fatalf("unexpected steps: %+v", steps)
+	if len(view.steps) != 1 || view.steps[0].conc != 4 {
+		t.Fatalf("unexpected steps: %+v", view.steps)
 	}
 
 	// 快照必须是拷贝，改动切片不能影响内部状态。
-	steps[0].conc = 999
-	if _, _, _, _, _, again := modeSnapshot(); again[0].conc != 4 {
+	view.steps[0].conc = 999
+	if again := modeSnapshot(); again.steps[0].conc != 4 {
 		t.Fatal("modeSnapshot must return a copy of the steps")
+	}
+}
+
+// 按键换算：10%/20%/30% 按比例，一倍是翻倍/减半。
+func TestScaledConcurrency(t *testing.T) {
+	cases := []struct {
+		current int
+		factor  float64
+		want    int
+	}{
+		{16, 1.10, 18}, // 17.6 -> 18
+		{16, 1.20, 19}, // 19.2 -> 19
+		{16, 1.30, 21}, // 20.8 -> 21
+		{16, 2.00, 32}, // 翻倍
+		{16, 0.90, 14}, // 14.4 -> 14
+		{16, 0.80, 13}, // 12.8 -> 13
+		{16, 0.70, 11}, // 11.2 -> 11
+		{16, 0.50, 8},  // 减半
+		{1, 0.50, 1},   // 不能降到 0
+		{1, 0.90, 1},   // 已经最小
+		{2, 0.90, 1},   // 18 以下的整数运算也要至少变 1
+		{300, 2.00, autoMaxConcurrency},
+	}
+	for _, c := range cases {
+		if got := scaledConcurrency(c.current, c.factor); got != c.want {
+			t.Errorf("scaledConcurrency(%d, %.2f) = %d, want %d", c.current, c.factor, got, c.want)
+		}
+	}
+}
+
+func TestScaleFactorKeys(t *testing.T) {
+	// 1-4 扩容，5-8 缩容，其余按键一律不处理。
+	for _, k := range []byte{'1', '2', '3', '4'} {
+		f, _, ok := scaleFactor(k)
+		if !ok || f <= 1 {
+			t.Errorf("key %q should increase concurrency, got factor=%.2f ok=%v", k, f, ok)
+		}
+	}
+	for _, k := range []byte{'5', '6', '7', '8'} {
+		f, _, ok := scaleFactor(k)
+		if !ok || f >= 1 {
+			t.Errorf("key %q should decrease concurrency, got factor=%.2f ok=%v", k, f, ok)
+		}
+	}
+	for _, k := range []byte{'0', '9', 'q', 'a', ' '} {
+		if _, _, ok := scaleFactor(k); ok {
+			t.Errorf("key %q should not be handled", k)
+		}
+	}
+}
+
+func TestConcurrencyLegendMentionsEveryKey(t *testing.T) {
+	legend := concurrencyLegend()
+	for _, k := range concurrencyKeys {
+		if !strings.Contains(legend, string(k.key)+":") {
+			t.Errorf("legend %q is missing key %q", legend, k.key)
+		}
+		if !strings.Contains(legend, k.label) {
+			t.Errorf("legend %q is missing label %q", legend, k.label)
+		}
+	}
+}
+
+// 手动按键必须真的改变有效并发，并把模式切到 manual。
+func TestAutoRampAdjustSwitchesToManual(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	opts := &benchOptions{timeout: time.Second}
+	var wg sync.WaitGroup
+
+	ramp := newAutoRamp(ctx, opts, &wg, 8)
+	if got := ramp.gate.Limit(); got != 8 {
+		t.Fatalf("initial limit = %d, want 8", got)
+	}
+	// 不启动 worker，只验证闸门与状态流转。
+	ramp.gate.SetLimit(8)
+
+	ramp.Adjust(2.00, "x2")
+
+	if got := ramp.gate.Limit(); got != 16 {
+		t.Fatalf("after x2 the limit = %d, want 16", got)
+	}
+	if !ramp.isManual() {
+		t.Fatal("a key press must switch the ramp to manual")
+	}
+	view := modeSnapshot()
+	if view.phase != "manual" {
+		t.Fatalf("phase = %q, want manual", view.phase)
+	}
+	if !strings.Contains(view.note, "x2") {
+		t.Fatalf("note = %q, want it to mention the key label", view.note)
+	}
+}
+
+// 取消之后不能再接受按键，否则会在 wg 上做危险的 Add。
+func TestAutoRampAdjustIgnoresCancelledContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	var wg sync.WaitGroup
+	ramp := newAutoRamp(ctx, &benchOptions{}, &wg, 8)
+
+	cancel()
+	time.Sleep(10 * time.Millisecond)
+
+	ramp.Adjust(2.00, "x2")
+	if got := ramp.gate.Limit(); got != 8 {
+		t.Fatalf("limit changed after cancellation: %d", got)
 	}
 }

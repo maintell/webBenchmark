@@ -272,42 +272,6 @@ func sendOnce(ctx context.Context, client *http.Client, opts *benchOptions, targ
 	return true
 }
 
-// 失败原因以前只进计数器，用户看到 Failed 在涨却不知道原因
-// （比如用 -6 去测一个只有 IPv4 的目标）。这里把每种错误打印一次，
-// 并把最后一条挂到状态栏上。
-var (
-	errMu     sync.Mutex
-	seenError = make(map[string]struct{})
-	lastError string
-)
-
-const maxDistinctErrors = 20
-
-func reportError(err error) {
-	if err == nil {
-		return
-	}
-	msg := err.Error()
-
-	errMu.Lock()
-	_, seen := seenError[msg]
-	if !seen && len(seenError) < maxDistinctErrors {
-		seenError[msg] = struct{}{}
-	}
-	lastError = msg
-	errMu.Unlock()
-
-	if !seen {
-		fmt.Fprintf(os.Stderr, "error: %s\n", msg)
-	}
-}
-
-func lastErrorMessage() string {
-	errMu.Lock()
-	defer errMu.Unlock()
-	return lastError
-}
-
 // countingReader 边读边累加字节数。
 // 如果等请求结束再一次性加，长时间下载期间 Loaded 会一直停在旧值，
 // 看起来像"没流量"，实际链路早就跑满了。
@@ -536,6 +500,17 @@ func main() {
 		if len(customIP) > start {
 			start = len(customIP)
 		}
+
+		// 自动模式下允许用单键随时微调并发；终端不支持 raw 模式时静默降级。
+		if restore, ok := startKeyReader(ctx, stop, func(factor float64, label string) {
+			if ramp := activeRamp.Load(); ramp != nil {
+				ramp.Adjust(factor, label)
+			}
+		}); ok {
+			setInteractive(true)
+			defer restore()
+		}
+
 		wg.Add(1)
 		go func() {
 			defer wg.Done()

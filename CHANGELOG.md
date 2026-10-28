@@ -98,6 +98,12 @@ covered by regression tests in `*_test.go`.
   containing failures never count as an improvement. Measured on a long haul link the ramp
   settled at 8 connections / 568 KB/s after the naive "last tried" version had walked up
   to 64 and stayed at 400 KB/s.
+- **Live concurrency keys in auto mode.** `1`/`2`/`3`/`4` raise the concurrency by 10%,
+  20%, 30% or 2x; `5`/`6`/`7`/`8` lower it by the same amounts. The first press takes
+  control (phase becomes `manual`, automatic ramping stops) and later presses keep
+  applying, so you can search by hand without restarting the run. Requires a real
+  terminal; with redirected stdin the `Keys:` line is simply omitted. Measured on a real
+  pty: 8 → +20% → 10 → x2 → 20 → −30% → 14.
 - `-nr` — open a new TCP connection per request.
 - `-t` — per-request timeout in seconds (default 30, `0` disables it).
 - `-4` / `-6` — pin the address family. IPv4 is the default; `-6` is an explicit opt in.
@@ -110,6 +116,9 @@ covered by regression tests in `*_test.go`.
 
 ### Changed
 
+- Terminal output now writes explicit `\r\n`. Reading keys requires raw mode, which turns
+  off the terminal's newline translation; without this the status bar would staircase.
+- Adds `golang.org/x/term` (pinned to a Go 1.21 compatible release) for portable raw mode.
 - **`-c` is now optional and defaults to auto.** Leaving it out (or passing `-c 0`) enables
   the auto ramp described above; a positive value keeps the old fixed concurrency.
 - **The default address family is now IPv4.** A benchmark result must not depend on which
