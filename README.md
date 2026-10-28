@@ -46,6 +46,10 @@ Current version: 0.10 — see [CHANGELOG.md](CHANGELOG.md) for what changed.
           size in bytes of the random post content (default 1024)
     -f
           randomize X-Forwarded-For and X-Real-IP (default true)
+    -px
+          spoof the whole set of proxy headers with a random client address on every
+          request; use it to check whether your own rate limits can be bypassed by a
+          forged address
     -fc string
           country code used to pick X-Forwarded-For addresses (default "cn")
     -d
@@ -151,6 +155,23 @@ Asset names:
   once in the background at startup. The list is never fetched on the request path, so a
   slow or blocked CDN cannot stall the benchmark; until it arrives (or if it never does)
   a fully random address is used. A failed download is reported once on stderr.
+
+- **`-px`, and what it can actually prove.** It fills every common proxy header
+  (`X-Forwarded-For`, `X-Real-IP`, `X-Client-IP`, `True-Client-IP`, `CF-Connecting-IP`,
+  `Fastly-Client-IP`, `X-Cluster-Client-IP`, `X-Originating-IP`, `X-Remote-IP`,
+  `X-Remote-Addr`, `X-Proxy-User-Ip`, `X-Original-For`, the RFC 7239 `Forwarded` header,
+  plus `X-Forwarded-Proto` / `X-Forwarded-Host` matching the real request) with a fresh
+  forged address on every request.
+
+  It only changes anything when the target **trusts** one of those headers, which is
+  normal behind a CDN or reverse proxy but never the case for a server that is reached
+  directly. There the limit is applied to the TCP source address and no header can move
+  it. Measured on a directly reachable host that caps clients per address: 501.9 KB/s
+  without `-px`, 502.5 KB/s with it, and 439.9 KB/s at four times the concurrency — the
+  forged headers changed nothing, which is itself the answer to the test.
+
+  Use it against infrastructure you are responsible for, together with the disclaimer in
+  this repository.
 - **`-4` / `-6`, and why IPv4 is the default.** A dual stack host can have one family
   connecting fine while transferring slowly, and neither Go nor curl will fall back just
   because a working connection is slow. Measured on one VPS against the same Cloudflare

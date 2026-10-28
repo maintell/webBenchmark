@@ -91,6 +91,15 @@ covered by regression tests in `*_test.go`.
 
 ### Added
 
+- **`-px` — spoof the full set of proxy headers.** Every request carries a fresh forged
+  client address in `X-Forwarded-For`, `X-Real-IP`, `X-Client-IP`, `True-Client-IP`,
+  `CF-Connecting-IP`, `Fastly-Client-IP`, `X-Cluster-Client-IP`, `X-Originating-IP`,
+  `X-Remote-IP`, `X-Remote-Addr`, `X-Proxy-User-Ip`, `X-Original-For` and the RFC 7239
+  `Forwarded` header, with `X-Forwarded-Proto` / `X-Forwarded-Host` kept consistent with
+  the real request so the edge does not reject it outright. It answers one question: do
+  my rate limits key on the address the proxy reports, or on the TCP source? Measured on a
+  directly reachable host: 501.9 KB/s without, 502.5 KB/s with — the limits were keyed on
+  the TCP source, so the feature correctly showed that no bypass exists.
 - **Auto ramp when `-c` is omitted.** Starts at 4 connections, measures 4 second windows
   and doubles while throughput beats the best result so far by more than 10%, then settles
   on the concurrency that produced that best result. A resizable gate lets it step back

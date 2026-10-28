@@ -36,6 +36,7 @@ type benchOptions struct {
 	timeout     time.Duration
 	family      ipFamily
 	gate        *limiter
+	proxySpoof  bool
 }
 
 var (
@@ -48,6 +49,7 @@ var (
 	referer         = flag.String("r", "", "referer url")
 	detectLocation  = flag.Bool("d", false, "resolve the real target from the Location header")
 	xforwardfor     = flag.Bool("f", true, "randomize X-Forwarded-For and X-Real-IP")
+	proxySpoof      = flag.Bool("px", false, "spoof the whole set of proxy headers with a random client address on every request; use it to test whether your own rate limits can be bypassed by a forged address")
 	xforwardCountry = flag.String("fc", "cn", "country code used to pick X-Forwarded-For addresses")
 	subscribe       = flag.String("sub", "", "subscribe url that returns the target url")
 	noReuse         = flag.Bool("nr", false, "open a new TCP connection for every request instead of reusing connections")
@@ -281,7 +283,10 @@ func sendOnce(ctx context.Context, client *http.Client, opts *benchOptions, targ
 	}
 	request.Header.Set("Referer", requestReferer)
 
-	if opts.xforwardfor {
+	if opts.proxySpoof {
+		// 伪造整套代理头：按"代理头里的客户端地址"做限流的服务端会看到每次都是新客户端。
+		applyProxyHeaders(request)
+	} else if opts.xforwardfor {
 		// 空值不再写进头里，服务端不会再收到一个空的 X-Forwarded-For。
 		// randomForwardedIP 永不阻塞，国家列表还没就绪时用完全随机地址。
 		if ip := randomForwardedIP(); ip != "" {
@@ -333,6 +338,57 @@ func (c *countingReader) Read(p []byte) (int, error) {
 		stats.bytes.Add(uint64(n))
 	}
 	return n, err
+}
+
+// spoofAnnounce 只提示一次，避免每请求刷一行。
+var spoofAnnounce sync.Once
+
+// proxyHeaderNames 是常见 CDN / 反向代理用来传递真实客户端地址的头。
+// 服务端（或它前面的 WAF）只要信任其中任意一个，按 IP 做的限流就能被伪造地址绕过。
+var proxyHeaderNames = []string{"X-Forwarded-For",
+	"X-Real-IP",
+	"X-Client-IP",
+	"Client-IP",
+	"True-Client-IP",
+	"CF-Connecting-IP",
+	"Fastly-Client-IP",
+	"X-Cluster-Client-IP",
+	"X-Originating-IP",
+	"X-Remote-IP",
+	"X-Remote-Addr",
+	"X-Proxy-User-Ip",
+	"X-Original-For",
+}
+
+// applyProxyHeaders 用同一个随机地址填满整套代理头。
+//
+// 只对"信任代理头"的部署有效：如果服务端直接面对客户端、按 TCP 源地址限流，
+// 这些头不会改变任何东西——这正是本开关要测出来的结论。
+func applyProxyHeaders(request *http.Request) {
+	ip := randomForwardedIP()
+	if ip == "" {
+		return
+	}
+	spoofAnnounce.Do(func() {
+		fmt.Fprintf(os.Stderr, "spoof: every proxy header carries a forged client address (first: %s)\n", ip)
+	})
+
+	scheme := request.URL.Scheme
+	if scheme == "" {
+		scheme = "https"
+	}
+
+	for _, name := range proxyHeaderNames {
+		request.Header.Set(name, ip)
+	}
+
+	// RFC 7239 的标准写法，和上面那堆自定义头格式不同。
+	request.Header.Set("Forwarded", fmt.Sprintf("for=%s;proto=%s", ip, scheme))
+	request.Header.Set("X-Forwarded-Proto", scheme)
+	if host := request.URL.Host; host != "" {
+		request.Header.Set("X-Forwarded-Host", host)
+		request.Header.Set("X-Original-Host", host)
+	}
 }
 
 // applyCustomHeaders 应用 -H。Key 和 Value 都支持 Random<N> 占位符。
@@ -516,7 +572,7 @@ func main() {
 	if len(*targetInput) > 0 && *detectLocation {
 		go refreshLocationLoop(ctx, *targetInput)
 	}
-	if *xforwardfor {
+	if *xforwardfor || *proxySpoof {
 		// 后台预热，绝不放到请求路径上，否则拉取慢时会卡住整个压测。
 		go preloadCountryCIDR(*xforwardCountry)
 	}
@@ -532,6 +588,7 @@ func main() {
 		noReuse:     *noReuse,
 		timeout:     time.Duration(*requestTimeout) * time.Second,
 		family:      selectedFamily(),
+		proxySpoof:  *proxySpoof,
 	}
 
 	var wg sync.WaitGroup

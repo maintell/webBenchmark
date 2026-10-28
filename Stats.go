@@ -113,16 +113,20 @@ func showStat(ctx context.Context) {
 		}
 
 		view := modeSnapshot()
+		spoof := ""
+		if *proxySpoof {
+			spoof = "  Spoof:proxy"
+		}
 		switch {
 		case !view.isAuto:
-			line("Mode:fixed  Conc:%d", view.level)
+			line("Mode:fixed  Conc:%d%s", view.level, spoof)
 		case view.phase == "settled" && view.best > 0:
-			line("Mode:auto  Phase:settled  Conc:%d  Peak:%s/s@%d",
-				view.level, readableBytes(view.best), view.peakAt)
+			line("Mode:auto  Phase:settled  Conc:%d  Peak:%s/s@%d%s",
+				view.level, readableBytes(view.best), view.peakAt, spoof)
 		case view.note != "":
-			line("Mode:auto  Phase:%s  Conc:%d  (%s)", view.phase, view.level, view.note)
+			line("Mode:auto  Phase:%s  Conc:%d  (%s)%s", view.phase, view.level, view.note, spoof)
 		default:
-			line("Mode:auto  Phase:%s  Conc:%d", view.phase, view.level)
+			line("Mode:auto  Phase:%s  Conc:%d%s", view.phase, view.level, spoof)
 		}
 
 		loaded := stats.bytes.Load()

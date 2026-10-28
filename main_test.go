@@ -183,6 +183,55 @@ func TestSendOnceCountsTruncatedBodyAsFailure(t *testing.T) {
 	}
 }
 
+// 代理头伪造：每个常见头都必须带上同一个合法地址，
+// 且 proto/host 要与真实请求一致，否则会被服务端直接当成非法请求。
+func TestApplyProxyHeadersSpoofsEveryCommonHeader(t *testing.T) {
+	req, err := http.NewRequest("GET", "https://example.com/x", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	applyProxyHeaders(req)
+
+	for _, name := range proxyHeaderNames {
+		got := req.Header.Get(name)
+		if net.ParseIP(got) == nil {
+			t.Errorf("header %s = %q, want a valid ip", name, got)
+		}
+	}
+
+	if got := req.Header.Get("X-Forwarded-Proto"); got != "https" {
+		t.Errorf("X-Forwarded-Proto = %q, want https", got)
+	}
+	if got := req.Header.Get("X-Forwarded-Host"); got != "example.com" {
+		t.Errorf("X-Forwarded-Host = %q, want example.com", got)
+	}
+
+	fwd := req.Header.Get("Forwarded")
+	if !strings.HasPrefix(fwd, "for=") || !strings.Contains(fwd, "proto=https") {
+		t.Errorf("Forwarded = %q, want RFC 7239 form with proto=https", fwd)
+	}
+}
+
+// 伪造开关优先级高于 -f：两者同时开着时也只走整套代理头，不重复设置。
+func TestProxySpoofTakesPrecedenceOverXForwardFor(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("CF-Connecting-IP") == "" {
+			t.Error("expected the wide proxy header set to be applied")
+		}
+		w.Write([]byte("ok"))
+	}))
+	defer srv.Close()
+
+	opts := &benchOptions{proxySpoof: true, xforwardfor: true, timeout: 5 * time.Second}
+	transport := newTransport(opts)
+	defer transport.CloseIdleConnections()
+	client := &http.Client{Transport: transport, Timeout: opts.timeout}
+
+	if !sendOnce(context.Background(), client, opts, srv.URL) {
+		t.Fatal("request should succeed")
+	}
+}
+
 // -t 0 表示不设超时，客户端不能因此退化成默认的无限等待以外的东西。
 func TestBenchmarkOptionsTimeoutZeroMeansNoTimeout(t *testing.T) {
 	opts := &benchOptions{timeout: 0}
