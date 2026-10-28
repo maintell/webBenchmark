@@ -56,6 +56,11 @@ covered by regression tests in `*_test.go`.
 
 ### Fixed — measurement fidelity
 
+- **The address family was left entirely to the system resolver.** Go prefers IPv6 on a
+  dual stack host, and a family can connect fine while being throttled, so nothing falls
+  back. Measured on one VPS against the same Cloudflare endpoint: IPv6 delivered 70 KB/s
+  and IPv4 delivered 143 MB/s, a difference of about 2000x, and the tool reported the
+  wrong one by default. `-4` and `-6` now pin the family explicitly.
 - **Every request carried a hardcoded 10 second timeout, which caps large downloads on
   slow links.** Aborting a body mid-flight discards the progress and forces a new TCP and
   TLS handshake, so the connection never leaves slow start. Pulling a 1.6 MB asset over a
@@ -83,9 +88,10 @@ covered by regression tests in `*_test.go`.
 
 - `-nr` — open a new TCP connection per request.
 - `-t` — per-request timeout in seconds (default 30, `0` disables it).
+- `-4` / `-6` — resolve the target to a single address family.
+- Status bar fields `Requests`, `Failed`, `Loaded`, `Avg` and `Elapsed`.
 - `-fc` — country code for the `X-Forwarded-For` address pool (default `cn`).
 - `-dns` — DNS server used for the target address display (default `8.8.8.8`).
-- Status bar fields `Requests`, `Failed` and `Loaded`.
 - Regression tests covering every item above; `go test -race ./...` is clean.
 - `-h` output now documents the flags with working examples.
 

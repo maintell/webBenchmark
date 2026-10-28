@@ -34,6 +34,7 @@ type benchOptions struct {
 	headers     headersList
 	noReuse     bool
 	timeout     time.Duration
+	family      ipFamily
 }
 
 var (
@@ -50,6 +51,8 @@ var (
 	subscribe       = flag.String("sub", "", "subscribe url that returns the target url")
 	noReuse         = flag.Bool("nr", false, "open a new TCP connection for every request instead of reusing connections")
 	requestTimeout  = flag.Int("t", 30, "per-request timeout in seconds, 0 means no timeout")
+	forceIPv4       = flag.Bool("4", false, "resolve the target to IPv4 addresses only")
+	forceIPv6       = flag.Bool("6", false, "resolve the target to IPv6 addresses only")
 	dnsServer       = flag.String("dns", "8.8.8.8", "dns server used for the target ip display")
 	TerminalWriter  = goterminal.New(os.Stdout)
 	customIP        ipArray
@@ -70,23 +73,78 @@ func getTargetURL() string {
 	return ""
 }
 
-// newDialer 把连接重定向到 -i 给出的地址，端口沿用目标 URL 自己的端口。
-// 旧实现拿 "https"/"http" 去匹配 host:port 形式的 addr，两个分支都永远不成立，
-// 结果一律拼成 ":80"，HTTPS 目标和非 80 端口目标全部失效。
-func newDialer(ips ipArray) func(ctx context.Context, network, addr string) (net.Conn, error) {
+// ipFamily 限制目标解析出来的地址族。
+// 双栈环境里一条地址族可能通但极慢（实测某 VPS 到 Cloudflare 的 IPv6 只有
+// 15 KB/s，IPv4 有 514 Mbps），而 Go 默认优先 IPv6，量出来会差几个数量级。
+type ipFamily int
+
+const (
+	familyAny ipFamily = iota
+	familyIPv4
+	familyIPv6
+)
+
+func (f ipFamily) String() string {
+	switch f {
+	case familyIPv4:
+		return "IPv4"
+	case familyIPv6:
+		return "IPv6"
+	default:
+		return "any"
+	}
+}
+
+// newDialer 把连接重定向到 -i 给出的地址，端口沿用目标 URL 自己的端口，
+// 或者按 -4 / -6 只使用指定地址族。
+func newDialer(ips ipArray, family ipFamily) func(ctx context.Context, network, addr string) (net.Conn, error) {
 	dialer := &net.Dialer{
 		Timeout:   30 * time.Second,
 		KeepAlive: 30 * time.Second,
 	}
 	return func(ctx context.Context, network, addr string) (net.Conn, error) {
-		_, port, err := net.SplitHostPort(addr)
+		host, port, err := net.SplitHostPort(addr)
 		if err != nil {
 			// 拿不到端口时按原样连接，不要瞎猜 80/443。
 			return dialer.DialContext(ctx, network, addr)
 		}
-		ip := ips[randIntn(len(ips))]
-		return dialer.DialContext(ctx, network, net.JoinHostPort(ip, port))
+		if len(ips) > 0 {
+			ip := ips[randIntn(len(ips))]
+			return dialer.DialContext(ctx, network, net.JoinHostPort(ip, port))
+		}
+		if family == familyAny {
+			return dialer.DialContext(ctx, network, addr)
+		}
+		return dialFamily(ctx, dialer, network, host, port, family)
 	}
+}
+
+// dialFamily 只用指定地址族去连，连不上就换下一个，不会退回另一族。
+func dialFamily(ctx context.Context, dialer *net.Dialer, network, host, port string, family ipFamily) (net.Conn, error) {
+	addrs, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+	if err != nil {
+		return nil, err
+	}
+	var lastErr error
+	tried := 0
+	for _, a := range addrs {
+		if family == familyIPv4 && a.IP.To4() == nil {
+			continue
+		}
+		if family == familyIPv6 && a.IP.To4() != nil {
+			continue
+		}
+		tried++
+		conn, dialErr := dialer.DialContext(ctx, network, net.JoinHostPort(a.IP.String(), port))
+		if dialErr == nil {
+			return conn, nil
+		}
+		lastErr = dialErr
+	}
+	if tried == 0 {
+		return nil, fmt.Errorf("no %s address found for %s", family, host)
+	}
+	return nil, lastErr
 }
 
 // newTransport 每个 goroutine 独占一个 Transport，连接池互不干扰。
@@ -100,8 +158,8 @@ func newTransport(opts *benchOptions) *http.Transport {
 		MaxIdleConnsPerHost: 256,
 		IdleConnTimeout:     90 * time.Second,
 	}
-	if len(opts.customIP) > 0 {
-		tr.DialContext = newDialer(opts.customIP)
+	if len(opts.customIP) > 0 || opts.family != familyAny {
+		tr.DialContext = newDialer(opts.customIP, opts.family)
 	}
 	return tr
 }
@@ -258,6 +316,18 @@ Examples:
 `)
 }
 
+// selectedFamily 把 -4 / -6 映射成地址族约束。
+func selectedFamily() ipFamily {
+	switch {
+	case *forceIPv4:
+		return familyIPv4
+	case *forceIPv6:
+		return familyIPv6
+	default:
+		return familyAny
+	}
+}
+
 // validateFlags 把明显写错的参数挡在启动阶段，而不是让它们变成静默空转。
 func validateFlags() error {
 	if *count < 0 {
@@ -268,6 +338,9 @@ func validateFlags() error {
 	}
 	if *requestTimeout < 0 {
 		return fmt.Errorf("-t must be >= 0, got %d", *requestTimeout)
+	}
+	if *forceIPv4 && *forceIPv6 {
+		return errors.New("-4 and -6 are mutually exclusive")
 	}
 	for _, ip := range customIP {
 		if ip == "" {
@@ -381,6 +454,7 @@ func main() {
 		headers:     headers,
 		noReuse:     *noReuse,
 		timeout:     time.Duration(*requestTimeout) * time.Second,
+		family:      selectedFamily(),
 	}
 
 	var wg sync.WaitGroup

@@ -94,7 +94,7 @@ func TestNewDialerKeepsRequestedPort(t *testing.T) {
 	port := probe.Addr().(*net.TCPAddr).Port
 	probe.Close()
 
-	dial := newDialer(ipArray{"127.0.0.1"})
+	dial := newDialer(ipArray{"127.0.0.1"}, familyAny)
 	conn, err := dial(context.Background(), "tcp", net.JoinHostPort("example.invalid", strconv.Itoa(port)))
 	if err == nil {
 		conn.Close()
@@ -190,5 +190,59 @@ func TestBenchmarkOptionsTimeoutZeroMeansNoTimeout(t *testing.T) {
 
 	if client.Timeout != 0 {
 		t.Fatalf("client timeout = %v, want 0 (disabled)", client.Timeout)
+	}
+}
+
+// 回归：双栈目标默认会优先 IPv6，而 IPv6 可能通但极慢。
+// 实测某 VPS 到 Cloudflare 的 IPv6 只有 15 KB/s、IPv4 有 514 Mbps，
+// 所以必须能把地址族钉住，否则结果会差几个数量级。
+func TestDialFamilyIPv4ReachesV4OnlyListener(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("ok"))
+	}))
+	defer srv.Close()
+
+	_, port, err := net.SplitHostPort(strings.TrimPrefix(srv.URL, "http://"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	conn, err := dialFamily(context.Background(), &net.Dialer{Timeout: 3 * time.Second},
+		"tcp", "localhost", port, familyIPv4)
+	if err != nil {
+		t.Fatalf("dialFamily IPv4 to localhost:%s failed: %v", port, err)
+	}
+	conn.Close()
+}
+
+func TestDialFamilyRejectsFamilyWithoutAddress(t *testing.T) {
+	// 127.0.0.1 只有 IPv4，要求 IPv6 时必须明确报错，而不是悄悄回退到 IPv4。
+	_, err := dialFamily(context.Background(), &net.Dialer{Timeout: 3 * time.Second},
+		"tcp", "127.0.0.1", "9", familyIPv6)
+	if err == nil {
+		t.Fatal("expected an error when no IPv6 address exists")
+	}
+}
+
+func TestSelectedFamily(t *testing.T) {
+	oldV4, oldV6 := *forceIPv4, *forceIPv6
+	defer func() { *forceIPv4, *forceIPv6 = oldV4, oldV6 }()
+
+	*forceIPv4, *forceIPv6 = false, false
+	if got := selectedFamily(); got != familyAny {
+		t.Errorf("default family = %v, want any", got)
+	}
+	*forceIPv4, *forceIPv6 = true, false
+	if got := selectedFamily(); got != familyIPv4 {
+		t.Errorf("-4 family = %v, want IPv4", got)
+	}
+	*forceIPv4, *forceIPv6 = false, true
+	if got := selectedFamily(); got != familyIPv6 {
+		t.Errorf("-6 family = %v, want IPv6", got)
+	}
+
+	*forceIPv4, *forceIPv6 = true, true
+	if err := validateFlags(); err == nil {
+		t.Error("expected an error when both -4 and -6 are given")
 	}
 }

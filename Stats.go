@@ -44,6 +44,7 @@ func snapshotNetCounters() map[string]netCounters {
 }
 
 func showStat(ctx context.Context) {
+	started := time.Now()
 	prev := snapshotNetCounters()
 	ipList := resolveTargetIPs()
 
@@ -66,8 +67,15 @@ func showStat(ctx context.Context) {
 		if ipList != "" {
 			fmt.Fprintf(TerminalWriter, "IP:%s\n", ipList)
 		}
-		fmt.Fprintf(TerminalWriter, "Requests:%d  Failed:%d  Loaded:%s\n",
-			stats.requests.Load(), stats.failed.Load(), readableBytes(float64(stats.bytes.Load())))
+		loaded := stats.bytes.Load()
+		elapsed := time.Since(started).Seconds()
+		var avg float64
+		if elapsed > 0 {
+			avg = float64(loaded) / elapsed
+		}
+		fmt.Fprintf(TerminalWriter, "Requests:%d  Failed:%d  Loaded:%s  Avg:%s/s  Elapsed:%ds\n",
+			stats.requests.Load(), stats.failed.Load(),
+			readableBytes(float64(loaded)), readableBytes(avg), int(elapsed))
 		fmt.Fprintf(TerminalWriter, "CPU:%.2f%% \n", firstPercent(percent))
 		if memStat != nil {
 			fmt.Fprintf(TerminalWriter, "Memory:%.3f%% \n", memStat.UsedPercent)
