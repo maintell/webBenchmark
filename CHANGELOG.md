@@ -60,7 +60,8 @@ covered by regression tests in `*_test.go`.
   dual stack host, and a family can connect fine while being throttled, so nothing falls
   back. Measured on one VPS against the same Cloudflare endpoint: IPv6 delivered 70 KB/s
   and IPv4 delivered 143 MB/s, a difference of about 2000x, and the tool reported the
-  wrong one by default. `-4` and `-6` now pin the family explicitly.
+  wrong one by default. The dialer now resolves IPv4 only unless `-6` is given, and stops
+  with an actionable error when the requested family has no address.
 - **Every request carried a hardcoded 10 second timeout, which caps large downloads on
   slow links.** Aborting a body mid-flight discards the progress and forces a new TCP and
   TLS handshake, so the connection never leaves slow start. Pulling a 1.6 MB asset over a
@@ -71,6 +72,10 @@ covered by regression tests in `*_test.go`.
   from reading the body was discarded, so `Requests` grew while `Loaded` stayed low and
   the shortfall looked like a slow server. A request now counts as completed only after
   its body has been read to the end; truncated bodies land in `Failed`.
+- **A run that produced no traffic gave no reason for it.** Errors only reached a counter,
+  so `-6` against an IPv4 only host looked like a silent stall. The reason now appears as
+  `LastError` in the status bar and is printed once on stderr; requests cancelled by
+  `Ctrl+C` are excluded so shutdown does not look like a failure.
 - **A new `Transport` was created for every request**, defeating the connection pool
   entirely: each request performed a fresh TCP (and TLS) handshake and idle connections
   were never reclaimed. 10114 requests now reuse 2 connections. `-nr` restores the
@@ -88,8 +93,9 @@ covered by regression tests in `*_test.go`.
 
 - `-nr` — open a new TCP connection per request.
 - `-t` — per-request timeout in seconds (default 30, `0` disables it).
-- `-4` / `-6` — resolve the target to a single address family.
-- Status bar fields `Requests`, `Failed`, `Loaded`, `Avg` and `Elapsed`.
+- `-4` / `-6` — pin the address family. IPv4 is the default; `-6` is an explicit opt in.
+- Status bar fields `Requests`, `Failed`, `Loaded`, `Avg` and `Elapsed`, plus a `LastError`
+  line; each distinct request error is also printed once on stderr.
 - `-fc` — country code for the `X-Forwarded-For` address pool (default `cn`).
 - `-dns` — DNS server used for the target address display (default `8.8.8.8`).
 - Regression tests covering every item above; `go test -race ./...` is clean.
@@ -97,6 +103,9 @@ covered by regression tests in `*_test.go`.
 
 ### Changed
 
+- **The default address family is now IPv4.** A benchmark result must not depend on which
+  family the resolver happened to prefer; pass `-6` when you actually want to exercise
+  IPv6.
 - `Ctrl+C` now cancels in-flight requests and restores the terminal.
 - Invalid `-H` values and invalid `-i` values (for example an address that includes a
   port) are reported at startup instead of being silently ignored.

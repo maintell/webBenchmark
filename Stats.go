@@ -76,6 +76,9 @@ func showStat(ctx context.Context) {
 		fmt.Fprintf(TerminalWriter, "Requests:%d  Failed:%d  Loaded:%s  Avg:%s/s  Elapsed:%ds\n",
 			stats.requests.Load(), stats.failed.Load(),
 			readableBytes(float64(loaded)), readableBytes(avg), int(elapsed))
+		if msg := lastErrorMessage(); msg != "" {
+			fmt.Fprintf(TerminalWriter, "LastError:%s\n", shortText(msg, 110))
+		}
 		fmt.Fprintf(TerminalWriter, "CPU:%.2f%% \n", firstPercent(percent))
 		if memStat != nil {
 			fmt.Fprintf(TerminalWriter, "Memory:%.3f%% \n", memStat.UsedPercent)
@@ -111,6 +114,16 @@ func firstPercent(percent []float64) float64 {
 		return 0
 	}
 	return percent[0]
+}
+
+// shortText 把可能带换行的错误压成一行并截断，避免撑坏状态栏。
+func shortText(s string, limit int) string {
+	s = strings.ReplaceAll(s, "\r", " ")
+	s = strings.ReplaceAll(s, "\n", " ")
+	if len(s) > limit {
+		return s[:limit] + "..."
+	}
+	return s
 }
 
 func sortedNames(counters map[string]netCounters) []string {

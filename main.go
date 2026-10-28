@@ -51,8 +51,8 @@ var (
 	subscribe       = flag.String("sub", "", "subscribe url that returns the target url")
 	noReuse         = flag.Bool("nr", false, "open a new TCP connection for every request instead of reusing connections")
 	requestTimeout  = flag.Int("t", 30, "per-request timeout in seconds, 0 means no timeout")
-	forceIPv4       = flag.Bool("4", false, "resolve the target to IPv4 addresses only")
-	forceIPv6       = flag.Bool("6", false, "resolve the target to IPv6 addresses only")
+	forceIPv4       = flag.Bool("4", false, "force IPv4 only; this is the default")
+	forceIPv6       = flag.Bool("6", false, "force IPv6 only instead of the default IPv4")
 	dnsServer       = flag.String("dns", "8.8.8.8", "dns server used for the target ip display")
 	TerminalWriter  = goterminal.New(os.Stdout)
 	customIP        ipArray
@@ -142,7 +142,7 @@ func dialFamily(ctx context.Context, dialer *net.Dialer, network, host, port str
 		lastErr = dialErr
 	}
 	if tried == 0 {
-		return nil, fmt.Errorf("no %s address found for %s", family, host)
+		return nil, fmt.Errorf("no %s address found for %s, %s", family, host, familyHint(family))
 	}
 	return nil, lastErr
 }
@@ -212,6 +212,7 @@ func sendOnce(ctx context.Context, client *http.Client, opts *benchOptions, targ
 	request, err := http.NewRequestWithContext(ctx, method, target, body)
 	if err != nil {
 		stats.failed.Add(1)
+		reportError(err)
 		return false
 	}
 
@@ -237,7 +238,12 @@ func sendOnce(ctx context.Context, client *http.Client, opts *benchOptions, targ
 
 	resp, err := client.Do(request)
 	if err != nil {
+		// Ctrl+C 打断的在途请求不算失败，也不该刷错误。
+		if ctx.Err() != nil {
+			return false
+		}
 		stats.failed.Add(1)
+		reportError(err)
 		return false
 	}
 
@@ -247,11 +253,51 @@ func sendOnce(ctx context.Context, client *http.Client, opts *benchOptions, targ
 	_, copyErr := io.Copy(io.Discard, &countingReader{r: resp.Body})
 	resp.Body.Close()
 	if copyErr != nil {
+		if ctx.Err() != nil {
+			return false
+		}
 		stats.failed.Add(1)
+		reportError(copyErr)
 		return false
 	}
 	stats.requests.Add(1)
 	return true
+}
+
+// 失败原因以前只进计数器，用户看到 Failed 在涨却不知道原因
+// （比如用 -6 去测一个只有 IPv4 的目标）。这里把每种错误打印一次，
+// 并把最后一条挂到状态栏上。
+var (
+	errMu     sync.Mutex
+	seenError = make(map[string]struct{})
+	lastError string
+)
+
+const maxDistinctErrors = 20
+
+func reportError(err error) {
+	if err == nil {
+		return
+	}
+	msg := err.Error()
+
+	errMu.Lock()
+	_, seen := seenError[msg]
+	if !seen && len(seenError) < maxDistinctErrors {
+		seenError[msg] = struct{}{}
+	}
+	lastError = msg
+	errMu.Unlock()
+
+	if !seen {
+		fmt.Fprintf(os.Stderr, "error: %s\n", msg)
+	}
+}
+
+func lastErrorMessage() string {
+	errMu.Lock()
+	defer errMu.Unlock()
+	return lastError
 }
 
 // countingReader 边读边累加字节数。
@@ -316,16 +362,25 @@ Examples:
 `)
 }
 
-// selectedFamily 把 -4 / -6 映射成地址族约束。
+// selectedFamily 返回本次要使用的地址族。
+//
+// 默认强制 IPv4：IPv6 的出网质量普遍参差，经常"能连上但极慢"，
+// 而 Go 只要发现 AAAA 就优先用 IPv6 且不会因为慢而回退，
+// 于是同一个目标能测出相差几个数量级的结果（实测某 VPS 差约 2000 倍）。
+// 作为一个测速工具，默认值必须稳定可解释，所以只有显式 -6 才走 IPv6。
 func selectedFamily() ipFamily {
-	switch {
-	case *forceIPv4:
-		return familyIPv4
-	case *forceIPv6:
+	if *forceIPv6 {
 		return familyIPv6
-	default:
-		return familyAny
 	}
+	return familyIPv4
+}
+
+// familyHint 在目标没有所需地址族时给出下一步怎么做。
+func familyHint(f ipFamily) string {
+	if f == familyIPv6 {
+		return "drop -6 to use the default IPv4"
+	}
+	return "add -6 if the target is IPv6 only"
 }
 
 // validateFlags 把明显写错的参数挡在启动阶段，而不是让它们变成静默空转。

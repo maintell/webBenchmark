@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -222,20 +223,72 @@ func TestDialFamilyRejectsFamilyWithoutAddress(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected an error when no IPv6 address exists")
 	}
+	if !strings.Contains(err.Error(), "-6") {
+		t.Fatalf("error should tell the user how to get IPv4, got: %v", err)
+	}
+}
+
+// 回归：失败原因必须可见且不刷屏。
+// 以前错误只进了计数器，用 -6 测一个只有 IPv4 的目标时，
+// 用户只看到 Failed 在涨，完全不知道是地址族不匹配。
+func TestReportErrorDedupesAndKeepsLast(t *testing.T) {
+	errMu.Lock()
+	seenError = make(map[string]struct{})
+	lastError = ""
+	errMu.Unlock()
+
+	reportError(errors.New("dial boom"))
+	reportError(errors.New("dial boom"))
+	reportError(errors.New("second boom"))
+
+	errMu.Lock()
+	defer errMu.Unlock()
+	if len(seenError) != 2 {
+		t.Fatalf("distinct errors = %d, want 2 (duplicates must not be re-printed)", len(seenError))
+	}
+	if lastError != "second boom" {
+		t.Fatalf("lastError = %q, want the most recent message", lastError)
+	}
+}
+
+func TestShortText(t *testing.T) {
+	if got := shortText("a\r\nb", 10); got != "a  b" {
+		t.Errorf("shortText should flatten newlines, got %q", got)
+	}
+	long := strings.Repeat("x", 200)
+	got := shortText(long, 10)
+	if got != "xxxxxxxxxx..." {
+		t.Errorf("shortText should truncate with an ellipsis, got %q", got)
+	}
+}
+
+func TestFamilyHint(t *testing.T) { // 默认 IPv4 遇到只有 IPv6 的目标时要能提示加 -6；
+	// 反过来要求 IPv6 但目标没有 AAAA 时要提示去掉 -6。
+	if got := familyHint(familyIPv4); !strings.Contains(got, "-6") {
+		t.Errorf("IPv4 hint should mention -6, got %q", got)
+	}
+	if got := familyHint(familyIPv6); !strings.Contains(got, "IPv4") {
+		t.Errorf("IPv6 hint should mention IPv4, got %q", got)
+	}
 }
 
 func TestSelectedFamily(t *testing.T) {
 	oldV4, oldV6 := *forceIPv4, *forceIPv6
 	defer func() { *forceIPv4, *forceIPv6 = oldV4, oldV6 }()
 
+	// 默认必须是 IPv4：双栈环境下 IPv6 常常通但极慢，而 Go 不会因为慢而回退。
 	*forceIPv4, *forceIPv6 = false, false
-	if got := selectedFamily(); got != familyAny {
-		t.Errorf("default family = %v, want any", got)
+	if got := selectedFamily(); got != familyIPv4 {
+		t.Errorf("default family = %v, want IPv4", got)
 	}
+
+	// 显式 -4 与默认一致，只是让脚本更自解释。
 	*forceIPv4, *forceIPv6 = true, false
 	if got := selectedFamily(); got != familyIPv4 {
 		t.Errorf("-4 family = %v, want IPv4", got)
 	}
+
+	// 只有显式 -6 才走 IPv6。
 	*forceIPv4, *forceIPv6 = false, true
 	if got := selectedFamily(); got != familyIPv6 {
 		t.Errorf("-6 family = %v, want IPv6", got)

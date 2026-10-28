@@ -13,7 +13,9 @@ Current version: 0.10 — see [CHANGELOG.md](CHANGELOG.md) for what changed.
 - specify multi target ip, or resolved by system dns.
 - randomly X-Forwarded-For and X-Real-IP (default on), picking addresses from a per-country CIDR list with a local fallback when the list is unreachable.
 - reuses connections by default; use `-nr` to force a new TCP connection per request.
-- `-4` / `-6` pin the address family, which matters on dual stack hosts where one family is throttled.
+- `-4` / `-6` pin the address family. **IPv4 is the default**: IPv6 egress is frequently
+  fine to connect and slow to transfer, and Go never falls back on slowness, so the
+  default has to be the predictable one. Use `-6` only when you mean to test IPv6.
 - live status shows request count, failure count, downloaded bytes and average throughput.
 
 # Todo 
@@ -52,9 +54,9 @@ Current version: 0.10 — see [CHANGELOG.md](CHANGELOG.md) for what changed.
     -t int
           per-request timeout in seconds, 0 disables it (default 30)
     -4
-          resolve the target to IPv4 addresses only
+          force IPv4 only; this is the default
     -6
-          resolve the target to IPv6 addresses only
+          force IPv6 only instead of the default IPv4
     -dns string
           dns server used for the target ip display (default "8.8.8.8")
 
@@ -101,20 +103,22 @@ Asset names:
   once in the background at startup. The list is never fetched on the request path, so a
   slow or blocked CDN cannot stall the benchmark; until it arrives (or if it never does)
   a fully random address is used. A failed download is reported once on stderr.
-- **`-4` / `-6`.** By default the address family follows the system resolver, and Go
-  prefers IPv6 when the host is dual stack. A dual stack host can have one family
-  working but severely throttled — measured on one VPS, an IPv6 path to the same
-  endpoint ran at 70 KB/s while IPv4 ran at 143 MB/s. Because the connection still
-  succeeds over the slow family, nothing falls back automatically, so pin the family
-  with `-4` before concluding that a server is slow. IPv4 only is the safer default
-  when you do not know the topology.
+- **`-4` / `-6`, and why IPv4 is the default.** A dual stack host can have one family
+  connecting fine while transferring slowly, and neither Go nor curl will fall back just
+  because a working connection is slow. Measured on one VPS against the same Cloudflare
+  endpoint, IPv6 delivered 70 KB/s and IPv4 delivered 143 MB/s. A benchmark whose answer
+  depends on which address family the resolver happened to prefer is not a benchmark, so
+  IPv4 is the default and `-6` is the explicit opt in. If the target has no IPv4 address
+  the tool stops with an error telling you to add `-6`, rather than silently switching.
 - **Status bar.** `Requests` / `Failed` / `Loaded` count completed responses, failed
   requests and downloaded bytes, `Avg` is the average throughput of the whole run and
-  `Elapsed` its duration. A request only counts as completed once its body has
-  been read to the end, so a body cut short by `-t` shows up in `Failed` instead of
-  silently inflating `Requests`. If `Failed` climbs while `Loaded` stays low, either the
-  target is slow or `-t` is too short for the file size you are pulling — raise `-t`
-  (or set `-t 0`) before trusting the throughput number.
+  `Elapsed` its duration. A `LastError` line appears as soon as something fails, and each
+  distinct error is printed once on stderr, so a run that produces no traffic tells you
+  why instead of just showing `Failed` climbing. A request only counts as completed once
+  its body has been read to the end, so a body cut short by `-t` shows up in `Failed`
+  instead of silently inflating `Requests`. If `Failed` climbs while `Loaded` stays low,
+  either the target is slow or `-t` is too short for the file size you are pulling — raise
+  `-t` (or set `-t 0`) before trusting the throughput number.
 - **Exit.** `Ctrl+C` cancels in-flight requests and restores the terminal.
 
 ## Build from source
