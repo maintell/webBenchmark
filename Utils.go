@@ -1,11 +1,10 @@
 package main
 
 import (
-	"container/list"
 	"fmt"
 	"math/rand"
+	"strconv"
 	"strings"
-	"time"
 )
 
 const (
@@ -14,16 +13,9 @@ const (
 	letterIdxMax  = 63 / letterIdxBits
 )
 
-type speedPair struct {
-	index uint64
-	speed float64
-}
-
 const letterBytes = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
 
-var SpeedQueue = list.New()
-var SpeedIndex uint64 = 0
-
+// header 保存一条原始 -H 参数，真正的随机化留到每次请求时再做。
 type header struct {
 	key, value string
 }
@@ -31,6 +23,9 @@ type header struct {
 type headersList []header
 
 func (h *headersList) String() string {
+	if h == nil {
+		return ""
+	}
 	return fmt.Sprint(*h)
 }
 
@@ -38,29 +33,45 @@ func (h *headersList) IsCumulative() bool {
 	return true
 }
 
+// Set 解析 -H 'Key:Value'。格式不对时返回错误，让 flag 直接报出来，
+// 而不是像以前那样静默丢弃用户写的头。
 func (h *headersList) Set(value string) error {
 	res := strings.SplitN(value, ":", 2)
 	if len(res) != 2 {
-		return nil
+		return fmt.Errorf("want 'Key:Value', got %q", value)
 	}
-	*h = append(*h, header{
-		res[0], strings.Trim(res[1], " "),
-	})
+	key := strings.TrimSpace(res[0])
+	if key == "" {
+		return fmt.Errorf("header name is empty in %q", value)
+	}
+	*h = append(*h, header{key: key, value: strings.TrimSpace(res[1])})
 	return nil
 }
 
 type ipArray []string
 
 func (i *ipArray) String() string {
+	if i == nil {
+		return ""
+	}
 	return strings.Join(*i, ",")
 }
 
-func (i *ipArray) Set(value string) (err error) {
-	*i = append(*i, strings.TrimSpace(value))
+func (i *ipArray) Set(value string) error {
+	v := strings.TrimSpace(value)
+	if v == "" {
+		return fmt.Errorf("empty address")
+	}
+	*i = append(*i, v)
 	return nil
 }
 
+// RandStringBytesMaskImpr 返回 n 个随机字母；n <= 0 时返回空串。
+// 使用 top-level 的 rand 函数，它自带锁，可被多个 goroutine 并发调用。
 func RandStringBytesMaskImpr(n int) string {
+	if n <= 0 {
+		return ""
+	}
 	b := make([]byte, n)
 	for i, cache, remain := n-1, rand.Int63(), letterIdxMax; i >= 0; {
 		if remain == 0 {
@@ -76,31 +87,26 @@ func RandStringBytesMaskImpr(n int) string {
 	return string(b)
 }
 
-func generateRandomIPAddress() string {
-	rand.Seed(time.Now().Unix())
-	ip := fmt.Sprintf("%d.%d.%d.%d", rand.Intn(255), rand.Intn(255), rand.Intn(255), rand.Intn(255))
-	return ip
+// randomCount 识别 "Random<N>" 形式的占位符。
+func randomCount(s string) (int, bool) {
+	if !strings.HasPrefix(s, "Random") {
+		return 0, false
+	}
+	n, err := strconv.Atoi(strings.TrimPrefix(s, "Random"))
+	if err != nil || n < 0 {
+		return 0, false
+	}
+	return n, true
 }
 
-func LeastSquares(x []float64, y []float64) (a float64, b float64) {
-	xi := float64(0)
-	x2 := float64(0)
-	yi := float64(0)
-	xy := float64(0)
-	if len(x) != len(y) {
-		a = 0
-		b = 0
-		return
-	} else {
-		length := float64(len(x))
-		for i := 0; i < len(x); i++ {
-			xi += x[i]
-			x2 += x[i] * x[i]
-			yi += y[i]
-			xy += x[i] * y[i]
-		}
-		a = (yi*xi - xy*length) / (xi*xi - x2*length)
-		b = (yi*x2 - xy*xi) / (x2*length - xi*xi)
+// randIntn 是 math/rand.Intn 的防御性包装，n<=0 时返回 0 而不是 panic。
+func randIntn(n int) int {
+	if n <= 0 {
+		return 0
 	}
-	return
+	return rand.Intn(n)
+}
+
+func generateRandomIPAddress() string {
+	return fmt.Sprintf("%d.%d.%d.%d", rand.Intn(256), rand.Intn(256), rand.Intn(256), rand.Intn(256))
 }

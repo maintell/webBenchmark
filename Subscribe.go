@@ -1,47 +1,53 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"strings"
 	"time"
 )
 
-func Subscribe(url string) string {
-	resp, err := http.Get(url)
+// Subscribe 拉取订阅地址返回的目标 URL。加了超时和响应体上限，
+// 订阅方挂住时不会把整个进程一起拖死。
+func Subscribe(subURL string) string {
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Get(subURL)
 	if err != nil {
-		fmt.Println("Error:", err)
+		fmt.Fprintf(os.Stderr, "subscribe %s: %v\n", subURL, err)
 		return ""
 	}
 	defer resp.Body.Close()
-	readAll, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
-		fmt.Println("Error:", err)
+		fmt.Fprintf(os.Stderr, "subscribe %s: %v\n", subURL, err)
 		return ""
 	}
-	return string(readAll)
+	return strings.TrimSpace(string(body))
 }
 
-func subscribeUpdate(url string) {
-	defer func() {
-		if r := recover(); r != nil {
-			go subscribeUpdate(url)
-		}
-	}()
+// subscribeLoop 每 30 秒刷新一次订阅得到的目标地址。
+func subscribeLoop(ctx context.Context, subURL string) {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
 	for {
-		time.Sleep(30 * time.Second)
-		subUrl := Subscribe(url)
-		if len(subUrl) > 0 {
-			if *detectLocation {
-				location := GetHttpLocation(subUrl)
-				if len(location) > 0 {
-					TargetUrl = location
-				} else {
-					TargetUrl = subUrl
-				}
-			} else {
-				TargetUrl = subUrl
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		next := Subscribe(subURL)
+		if next == "" {
+			continue
+		}
+		if *detectLocation {
+			if loc := GetHttpLocation(next); loc != "" {
+				setTargetURL(loc)
+				continue
 			}
 		}
+		setTargetURL(next)
 	}
 }

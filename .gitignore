@@ -1,2 +1,10 @@
 .idea
 bin
+
+# build outputs (build.bat / go build)
+webBenchmark_linux_x64
+webBenchmark_linux_arm
+webBenchmark_x64.exe
+webBenchmark_bsd_x64.exe
+*.test
+*.out
