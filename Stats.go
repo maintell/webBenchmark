@@ -161,7 +161,13 @@ func showStat(ctx context.Context) {
 				if s.failed > 0 {
 					mark = fmt.Sprintf("  [failed:%d]", s.failed)
 				}
-				line("  conc=%-4d %10s/s %s%s", s.conc, readableBytes(s.rate), change, mark)
+				// 每连接速率：并发翻倍而它减半，说明总带宽被目标按 IP 卡住了。
+				perConn := 0.0
+				if s.conc > 0 {
+					perConn = s.rate / float64(s.conc)
+				}
+				line("  conc=%-4d %10s/s  %8s/s/conn %s%s",
+					s.conc, readableBytes(s.rate), readableBytes(perConn), change, mark)
 			}
 		}
 

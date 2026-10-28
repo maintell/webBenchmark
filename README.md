@@ -100,12 +100,22 @@ Asset names:
   stays visible in the status bar:
 
   ```
-  Mode:auto  Phase:settled  Conc:8  Peak:568.000KB/s@8
+  Mode:auto  Phase:settled  Conc:8  Peak:552.000KB/s@8
+  Requests:2  Failed:0  Loaded:14.277MB  Avg:503.839KB/s  Elapsed:29s
   Ramp:
-    conc=4     480.000KB/s       -
-    conc=8     528.000KB/s  +10.0%
-    conc=8     568.000KB/s   +7.6%  <- plateau
+    conc=4     472.000KB/s  118.000KB/s/conn       -
+    conc=8     480.000KB/s   60.000KB/s/conn   +1.7%
+    conc=8     552.000KB/s   69.000KB/s/conn  +15.0%
+    conc=16    440.000KB/s   27.500KB/s/conn  -20.3%
+    conc=16    523.412KB/s   32.713KB/s/conn   -5.2%  <- plateau
   ```
+
+  The `s/conn` column is the diagnostic for "more concurrency but no more
+  throughput": when it divides roughly in half every time the concurrency doubles while
+  the total stays flat, the server is capping you per client address and no amount of
+  parallel connections will help. Measured example: one host served ~450 KB/s to a single
+  address no matter whether that address used 1 or 8 connections, and two different
+  addresses running at the same time each still got ~450 KB/s.
 
   Comparisons are made against the historical peak rather than the previous window,
   because a single 4 second window on a long haul link can swing by 30%. Pass `-c N` for

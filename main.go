@@ -120,9 +120,48 @@ func newDialer(ips ipArray, family ipFamily) func(ctx context.Context, network, 
 	}
 }
 
+// resolveCache 缓存目标地址解析结果。
+// dialFamily 以前每建一条连接就查一次解析器；自动模式爬坡时会连续建很多连接，
+// 这些重复查询纯属白花时间，在高 RTT 环境下还会叠加到建连延迟上。
+type resolveCacheEntry struct {
+	addrs   []net.IPAddr
+	expires time.Time
+}
+
+const resolveTTL = 60 * time.Second
+
+var (
+	resolveMu    sync.Mutex
+	resolveTable = make(map[string]resolveCacheEntry)
+)
+
+func cachedLookup(ctx context.Context, host string) ([]net.IPAddr, error) {
+	if ip := net.ParseIP(host); ip != nil {
+		return []net.IPAddr{{IP: ip}}, nil
+	}
+
+	resolveMu.Lock()
+	if e, ok := resolveTable[host]; ok && time.Now().Before(e.expires) {
+		addrs := e.addrs
+		resolveMu.Unlock()
+		return addrs, nil
+	}
+	resolveMu.Unlock()
+
+	addrs, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+	if err != nil {
+		return nil, err
+	}
+
+	resolveMu.Lock()
+	resolveTable[host] = resolveCacheEntry{addrs: addrs, expires: time.Now().Add(resolveTTL)}
+	resolveMu.Unlock()
+	return addrs, nil
+}
+
 // dialFamily 只用指定地址族去连，连不上就换下一个，不会退回另一族。
 func dialFamily(ctx context.Context, dialer *net.Dialer, network, host, port string, family ipFamily) (net.Conn, error) {
-	addrs, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+	addrs, err := cachedLookup(ctx, host)
 	if err != nil {
 		return nil, err
 	}
@@ -148,12 +187,21 @@ func dialFamily(ctx context.Context, dialer *net.Dialer, network, host, port str
 	return nil, lastErr
 }
 
+// sharedSessionCache 让所有 worker 共享 TLS 会话票据。
+// Go 的 tls.Config 默认 ClientSessionCache 是 nil，也就是完全不做会话复用：
+// 每新建一条连接都要走完整握手。在高 RTT 链路上一条握手就要两个来回，
+// 而自动模式恰恰会在爬坡阶段连续新建很多连接，这笔开销直接吃掉了爬坡期的吞吐。
+var sharedSessionCache = tls.NewLRUClientSessionCache(256)
+
 // newTransport 每个 goroutine 独占一个 Transport，连接池互不干扰。
 // 以前 Transport 建在 for 循环里，每个请求都要重新握手，连接池等于不存在。
 func newTransport(opts *benchOptions) *http.Transport {
 	tr := &http.Transport{
 		// 压测对象常常是裸 IP 或自签证书，证书链校验在这里没有意义。
-		TLSClientConfig:     &tls.Config{InsecureSkipVerify: true},
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: true,
+			ClientSessionCache: sharedSessionCache,
+		},
 		DisableKeepAlives:   opts.noReuse,
 		MaxIdleConns:        256,
 		MaxIdleConnsPerHost: 256,

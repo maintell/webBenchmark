@@ -104,6 +104,15 @@ covered by regression tests in `*_test.go`.
   applying, so you can search by hand without restarting the run. Requires a real
   terminal; with redirected stdin the `Keys:` line is simply omitted. Measured on a real
   pty: 8 → +20% → 10 → x2 → 20 → −30% → 14.
+- **TLS session resumption.** `tls.Config` defaults `ClientSessionCache` to nil, so every
+  connection paid a full handshake. The cache is now shared across all workers, which
+  matters most while the auto ramp is opening connections: at 128 concurrent connections on
+  a ~1 s RTT path the measured rate went from 123 KB/s to 146 KB/s.
+- **Resolution cache for dialling.** `dialFamily` queried the resolver on every new
+  connection; results are now cached for 60 s per host.
+- **The ramp table shows the rate per connection.** When it halves every time the
+  concurrency doubles while the total stays flat, the target is capping you per client
+  address rather than the tool leaving capacity unused.
 - `-nr` — open a new TCP connection per request.
 - `-t` — per-request timeout in seconds (default 30, `0` disables it).
 - `-4` / `-6` — pin the address family. IPv4 is the default; `-6` is an explicit opt in.
