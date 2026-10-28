@@ -147,3 +147,48 @@ func TestApplyCustomHeadersRandomizesValue(t *testing.T) {
 		t.Fatalf("sign should only contain letters, got %q", got)
 	}
 }
+
+// 回归：响应体读到一半超时不能再算成功。
+// 旧写法在拿到响应头时就 requests++，读响应体的错误直接丢弃，
+// 于是大文件在慢链路上被 10 秒超时反复截断，计数仍然"全绿"。
+func TestSendOnceCountsTruncatedBodyAsFailure(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", "1048576")
+		w.WriteHeader(http.StatusOK)
+		w.Write(make([]byte, 1024))
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		time.Sleep(500 * time.Millisecond)
+	}))
+	defer srv.Close()
+
+	opts := &benchOptions{timeout: 150 * time.Millisecond}
+	transport := newTransport(opts)
+	defer transport.CloseIdleConnections()
+	client := &http.Client{Transport: transport, Timeout: opts.timeout}
+
+	beforeFailed := stats.failed.Load()
+	beforeRequests := stats.requests.Load()
+
+	if sendOnce(context.Background(), client, opts, srv.URL) {
+		t.Fatal("a truncated body must not be reported as a successful request")
+	}
+	if got := stats.failed.Load(); got != beforeFailed+1 {
+		t.Fatalf("failed counter = %d, want %d", got, beforeFailed+1)
+	}
+	if got := stats.requests.Load(); got != beforeRequests {
+		t.Fatalf("requests counter = %d, want it to stay at %d", got, beforeRequests)
+	}
+}
+
+// -t 0 表示不设超时，客户端不能因此退化成默认的无限等待以外的东西。
+func TestBenchmarkOptionsTimeoutZeroMeansNoTimeout(t *testing.T) {
+	opts := &benchOptions{timeout: 0}
+	client := &http.Client{Transport: newTransport(opts), Timeout: opts.timeout}
+	defer client.Transport.(*http.Transport).CloseIdleConnections()
+
+	if client.Timeout != 0 {
+		t.Fatalf("client timeout = %v, want 0 (disabled)", client.Timeout)
+	}
+}

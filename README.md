@@ -48,6 +48,8 @@ Current version: 0.10 — see [CHANGELOG.md](CHANGELOG.md) for what changed.
           subscribe url that returns the target url
     -nr
           open a new TCP connection for every request instead of reusing connections
+    -t int
+          per-request timeout in seconds, 0 disables it (default 30)
     -dns string
           dns server used for the target ip display (default "8.8.8.8")
 
@@ -94,10 +96,12 @@ Asset names:
   once in the background at startup. The list is never fetched on the request path, so a
   slow or blocked CDN cannot stall the benchmark; until it arrives (or if it never does)
   a fully random address is used. A failed download is reported once on stderr.
-- **Status bar.** `Requests` / `Failed` / `Loaded` count successful responses, failed
-  requests and downloaded bytes. Because it shows what actually left the machine, a run
-  that reports `Failed` growing while `Requests` stays at 0 is a connectivity problem,
-  not a slow server.
+- **Status bar.** `Requests` / `Failed` / `Loaded` count completed responses, failed
+  requests and downloaded bytes. A request only counts as completed once its body has
+  been read to the end, so a body cut short by `-t` shows up in `Failed` instead of
+  silently inflating `Requests`. If `Failed` climbs while `Loaded` stays low, either the
+  target is slow or `-t` is too short for the file size you are pulling — raise `-t`
+  (or set `-t 0`) before trusting the throughput number.
 - **Exit.** `Ctrl+C` cancels in-flight requests and restores the terminal.
 
 ## Build from source

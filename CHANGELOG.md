@@ -56,6 +56,16 @@ covered by regression tests in `*_test.go`.
 
 ### Fixed — measurement fidelity
 
+- **Every request carried a hardcoded 10 second timeout, which caps large downloads on
+  slow links.** Aborting a body mid-flight discards the progress and forces a new TCP and
+  TLS handshake, so the connection never leaves slow start. Pulling a 1.6 MB asset over a
+  ~7 Mbit international link, the tool reported 267 KB/s while eight parallel `curl`
+  processes on the same host sustained 894 KB/s. The timeout is now `-t` (default 30
+  seconds, `0` disables it).
+- **A body cut short by the timeout still counted as a successful request.** The error
+  from reading the body was discarded, so `Requests` grew while `Loaded` stayed low and
+  the shortfall looked like a slow server. A request now counts as completed only after
+  its body has been read to the end; truncated bodies land in `Failed`.
 - **A new `Transport` was created for every request**, defeating the connection pool
   entirely: each request performed a fresh TCP (and TLS) handshake and idle connections
   were never reclaimed. 10114 requests now reuse 2 connections. `-nr` restores the
@@ -72,6 +82,7 @@ covered by regression tests in `*_test.go`.
 ### Added
 
 - `-nr` — open a new TCP connection per request.
+- `-t` — per-request timeout in seconds (default 30, `0` disables it).
 - `-fc` — country code for the `X-Forwarded-For` address pool (default `cn`).
 - `-dns` — DNS server used for the target address display (default `8.8.8.8`).
 - Status bar fields `Requests`, `Failed` and `Loaded`.

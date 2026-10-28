@@ -33,6 +33,7 @@ type benchOptions struct {
 	customIP    ipArray
 	headers     headersList
 	noReuse     bool
+	timeout     time.Duration
 }
 
 var (
@@ -48,6 +49,7 @@ var (
 	xforwardCountry = flag.String("fc", "cn", "country code used to pick X-Forwarded-For addresses")
 	subscribe       = flag.String("sub", "", "subscribe url that returns the target url")
 	noReuse         = flag.Bool("nr", false, "open a new TCP connection for every request instead of reusing connections")
+	requestTimeout  = flag.Int("t", 30, "per-request timeout in seconds, 0 means no timeout")
 	dnsServer       = flag.String("dns", "8.8.8.8", "dns server used for the target ip display")
 	TerminalWriter  = goterminal.New(os.Stdout)
 	customIP        ipArray
@@ -111,7 +113,7 @@ func runBenchmark(ctx context.Context, opts *benchOptions, target func() string)
 
 	client := &http.Client{
 		Transport: transport,
-		Timeout:   10 * time.Second,
+		Timeout:   opts.timeout,
 	}
 
 	for {
@@ -180,14 +182,33 @@ func sendOnce(ctx context.Context, client *http.Client, opts *benchOptions, targ
 		stats.failed.Add(1)
 		return false
 	}
-	stats.requests.Add(1)
 
-	written, _ := io.Copy(io.Discard, resp.Body)
+	// 只有在响应体读完、请求真正结束时才算成功。
+	// 旧写法在拿到响应头时就记成功，读响应体时的超时被直接丢掉，
+	// 于是"截断的请求"被当成成功，Loaded 明显低于实际链路能力。
+	_, copyErr := io.Copy(io.Discard, &countingReader{r: resp.Body})
 	resp.Body.Close()
-	if written > 0 {
-		stats.bytes.Add(uint64(written))
+	if copyErr != nil {
+		stats.failed.Add(1)
+		return false
 	}
+	stats.requests.Add(1)
 	return true
+}
+
+// countingReader 边读边累加字节数。
+// 如果等请求结束再一次性加，长时间下载期间 Loaded 会一直停在旧值，
+// 看起来像"没流量"，实际链路早就跑满了。
+type countingReader struct {
+	r io.Reader
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	if n > 0 {
+		stats.bytes.Add(uint64(n))
+	}
+	return n, err
 }
 
 // applyCustomHeaders 应用 -H。Key 和 Value 都支持 Random<N> 占位符。
@@ -244,6 +265,9 @@ func validateFlags() error {
 	}
 	if *randomPostSize < 0 {
 		return fmt.Errorf("-rps must be >= 0, got %d", *randomPostSize)
+	}
+	if *requestTimeout < 0 {
+		return fmt.Errorf("-t must be >= 0, got %d", *requestTimeout)
 	}
 	for _, ip := range customIP {
 		if ip == "" {
@@ -356,6 +380,7 @@ func main() {
 		customIP:    customIP,
 		headers:     headers,
 		noReuse:     *noReuse,
+		timeout:     time.Duration(*requestTimeout) * time.Second,
 	}
 
 	var wg sync.WaitGroup
