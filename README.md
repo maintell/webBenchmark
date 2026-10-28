@@ -17,7 +17,6 @@ Current version: 0.10 — see [CHANGELOG.md](CHANGELOG.md) for what changed.
 
 # Todo 
 - automatically tune concurrent routines to gain maximum performance. 
-- subscription benchmark task from remote server.
 
 # Usage
     webBenchmark -c [COUNT] -s [URL] -r [REFERER]
