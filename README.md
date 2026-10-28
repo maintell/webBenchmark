@@ -3,38 +3,69 @@ http benchmark tool to ran out your server bandwidth.
 
 用户在使用本工具前请先查看授权及免责声明，webBenchmark仅仅是一个用于测试网页服务器性能的工具，用作其他用途，后果自负。
 
+Current version: 0.10 — see [CHANGELOG.md](CHANGELOG.md) for what changed.
+
 - random User-Agent on every Request
 - customizable Referer Url,
 - customizable header,
 - concurrent routines as you wish, depends on you server performance.
-- http post mode
+- http post mode, with optional random payload size
 - specify multi target ip, or resolved by system dns.
-- randomly X-Forwarded-For and X-Real-IP (default on).
+- randomly X-Forwarded-For and X-Real-IP (default on), picking addresses from a per-country CIDR list with a local fallback when the list is unreachable.
+- reuses connections by default; use `-nr` to force a new TCP connection per request.
+- live status shows request count, failure count and downloaded bytes.
 
 # Todo 
 - automatically tune concurrent routines to gain maximum performance. 
-- support NOT standard port in address with specify target ip.
 - subscription benchmark task from remote server.
 
 # Usage
     webBenchmark -c [COUNT] -s [URL] -r [REFERER]
     -c int
-          concurrent routines for download (default 16)
+          concurrent routines (default 16)
+    -s string
+          target url, must start with http:// or https://
     -r string
           referer url
-    -s string
-          target url (default "https://baidu.com")
     -i string
-          custom ip address for that domain, multiple addresses automatically will be assigned randomly
-    -H http header pattern
-          http header pattern, use Random with number prefix will generate random string, same key will be overwritten
-    -f string
-          randomized X-Forwarded-For and X-Real-IP address
+          custom ip address for that domain, multiple addresses are picked at random;
+          the port always comes from -s, so non standard ports work
+    -H value
+          custom header, e.g. -H 'regid:123' -H 'sign:Random16';
+          a Random<N> key or value expands to N random letters
     -p string
           post content
+    -rp
+          send random post content on every request
+    -rps int
+          size in bytes of the random post content (default 1024)
+    -f
+          randomize X-Forwarded-For and X-Real-IP (default true)
+    -fc string
+          country code used to pick X-Forwarded-For addresses (default "cn")
+    -d
+          resolve the real target from the Location header
+    -sub string
+          subscribe url that returns the target url
+    -nr
+          open a new TCP connection for every request instead of reusing connections
+    -dns string
+          dns server used for the target ip display (default "8.8.8.8")
 
-# Linux
-    wget https://github.com/maintell/webBenchmark/releases/download/0.5/webBenchmark_linux_x64
+# Download
+
+    https://github.com/maintell/webBenchmark/releases/latest
+
+Asset names:
+
+    webBenchmark_linux_x64      linux / amd64
+    webBenchmark_linux_arm      linux / arm
+    webBenchmark_x64.exe        windows / amd64
+    webBenchmark_bsd_x64.exe    freebsd / amd64
+
+# Usage on Linux
+
+    wget https://github.com/maintell/webBenchmark/releases/latest/download/webBenchmark_linux_x64
     chmod +x webBenchmark_linux_x64
     ./webBenchmark_linux_x64 -c 32 -s https://target.url
 
@@ -43,10 +74,42 @@ http benchmark tool to ran out your server bandwidth.
     # and refer is https://refer.url 
     ./webBenchmark_linux_x64 -c 32 -s https://target.url -r https://refer.url -i 10.0.0.1 -i 10.0.0.2
     # send request to https://target.url with header regid:123 and sign:Random10
-    ./webBenchmark_linux_x64 -s https://target.url -H 'regid:123' -H 'sign:QpXDYHdVzB'
-    
+    ./webBenchmark_linux_x64 -s https://target.url -H 'regid:123' -H 'sign:Random10'
+    # same, but open a fresh TCP connection for every request instead of reusing it
+    ./webBenchmark_linux_x64 -s https://target.url -nr
 
+## Behaviour notes
 
+- **Connection reuse.** By default every routine keeps one persistent connection and
+  reuses it, which measures application level throughput. `-nr` disables keep-alive so
+  each request pays a full TCP (and TLS) handshake; use it to measure handshake overhead
+  or to emulate clients that never reuse connections.
+- **`-i` and ports.** `-i` only replaces the address that gets dialed. The port always
+  comes from `-s`, so `-s https://host:8443` dials `<ip>:8443`, and HTTPS targets keep
+  working because the dial hook no longer forces port 80.
+- **`-d` looks at the first hop only.** It sends one request and reads the `Location`
+  header without following the redirect. The probe therefore never adds traffic to the
+  real target, and it still works when the redirect destination is unreachable. Relative
+  `Location` values are resolved against `-s`. The target is re-checked every 60 seconds.
+- **`-f` / `-fc`.** Addresses are picked from a per-country CIDR list that is downloaded
+  once in the background at startup. The list is never fetched on the request path, so a
+  slow or blocked CDN cannot stall the benchmark; until it arrives (or if it never does)
+  a fully random address is used. A failed download is reported once on stderr.
+- **Status bar.** `Requests` / `Failed` / `Loaded` count successful responses, failed
+  requests and downloaded bytes. Because it shows what actually left the machine, a run
+  that reports `Failed` growing while `Requests` stays at 0 is a connectivity problem,
+  not a slow server.
+- **Exit.** `Ctrl+C` cancels in-flight requests and restores the terminal.
+
+## Build from source
+
+Requires Go 1.21 or newer.
+
+    go build -o webBenchmark_x64.exe .
+    go test ./...
+
+Cross compile all targets at once with `build.bat` (windows shell), which produces the
+four binaries listed above.
 
 ## LICENSE AND DISCLAIMER
 
