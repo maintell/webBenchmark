@@ -429,8 +429,11 @@ func (a *agent) run(ctx context.Context) error {
 		if !sleepCtx(ctx, backoff) {
 			return nil
 		}
-		if backoff < 30*time.Second {
-			backoff *= 2
+		// 先翻倍再夹上限：写成"小于 30 才翻倍"会让退避停在 32 秒，
+		// 和上限常量说的不是一回事。
+		backoff *= 2
+		if backoff > distMaxReconnectBackoff {
+			backoff = distMaxReconnectBackoff
 		}
 	}
 }

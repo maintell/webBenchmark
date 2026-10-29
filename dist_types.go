@@ -30,6 +30,11 @@ const (
 	distMaxDurationSec     = 24 * 60 * 60
 )
 
+// distMaxReconnectBackoff 是从节点重连退避的上限。
+// 主控可能只是重启几分钟，退避再长也没有意义；
+// 而一秒一次的重连对主控是纯粹的噪声。
+const distMaxReconnectBackoff = 30 * time.Second
+
 // 任务状态。主控用它决定控制台怎么显示、是否还要继续等结果。
 const (
 	taskRunning  = "running"
