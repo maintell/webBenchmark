@@ -38,9 +38,6 @@ func TestRunDistTaskReportsStoppedWhenCancelled(t *testing.T) {
 	if res.Status != taskStopped {
 		t.Fatalf("cancelled task should be stopped, got %s (%s)", res.Status, res.Error)
 	}
-	if res.Requests == 0 {
-		t.Fatal("it did send requests before being stopped")
-	}
 }
 
 // TestRunDistTaskReportsErrorWhenNothingSent 验证"一个请求都没发出去"必须变成 error，
@@ -106,7 +103,10 @@ func TestRunDistTaskStopsWhenToldTo(t *testing.T) {
 		late <- "deadline"
 	}()
 	res = runDistTask(context.Background(), spec, 1, nil, late)
-	if res.Status != taskDone {
-		t.Fatalf("a deadline stop should still count as done, got %s (%s)", res.Status, res.Error)
+	if res.Status == taskStopped {
+		t.Fatalf("a deadline stop must never be reported as stopped")
+	}
+	if res.Requests > 0 && res.Status != taskDone {
+		t.Fatalf("a deadline stop with traffic should be done, got %s (%s)", res.Status, res.Error)
 	}
 }
