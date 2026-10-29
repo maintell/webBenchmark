@@ -21,7 +21,7 @@ import (
 	"github.com/apoorvam/goterminal"
 )
 
-const version = "0.12"
+const version = "0.13"
 
 type benchOptions struct {
 	postContent string

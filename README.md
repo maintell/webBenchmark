@@ -3,7 +3,7 @@ http benchmark tool to ran out your server bandwidth.
 
 用户在使用本工具前请先查看授权及免责声明，webBenchmark仅仅是一个用于测试网页服务器性能的工具，用作其他用途，后果自负。
 
-Current version: 0.12 — see [CHANGELOG.md](CHANGELOG.md) for what changed.
+Current version: 0.13 — see [CHANGELOG.md](CHANGELOG.md) for what changed.
 
 - random User-Agent on every Request
 - customizable Referer Url,

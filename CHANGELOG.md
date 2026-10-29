@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.13
+
+### Fixed
+
+- **The agent's reconnect backoff stopped at 32 s instead of the 30 s cap it claims.** The
+  loop doubled the delay only while it was below the cap, so 16 s became 32 s and stayed
+  there — the log line said `32s 后重连`, which matched the behaviour but not the constant
+  or the comment. The delay is now doubled first and then clamped, so the cap, the comment
+  and the log agree.
+
+Nothing else changed: 0.13 is 0.12 plus this one fix. The encrypted WebSocket channel,
+http/https support and the SSH installer all ship in 0.12 and are unchanged here.
+
 ## 0.12
 
 ### Changed — the agent channel is now one encrypted WebSocket
