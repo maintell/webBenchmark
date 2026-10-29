@@ -1,5 +1,68 @@
 # Changelog
 
+## 0.11
+
+### Added — distributed load testing
+
+- **Master / agent split.** `-master 0.0.0.0:8443` runs the control plane and a web
+  console on one TLS port; `-join wb1_...` turns any other host into a load generator.
+  The master splits the requested total concurrency across the selected nodes
+  (`ceil(total / nodes)`, clamped to 1..256 each) and streams every node's progress into
+  one live view with an aggregate RPS chart.
+- **Agents never listen.** They dial the master, long-poll for start/stop commands and
+  push a sample every second, so a generator can live in the most restricted segment
+  and needs no inbound rule. A task is limited to 64 nodes, 256 connections per node
+  and 24 hours.
+- **Rates come from counters, not clocks.** Nodes report cumulative
+  requests/failed/bytes; the master derives per-node and aggregate rates from
+  successive samples, so clock skew between machines cannot fabricate a throughput
+  number. Reported peak RPS is never below the average.
+- **Task states say what happened.** `done` (ran to its duration), `stopped` (console
+  stop), `degraded` (a node stopped reporting). A node that misses the deadline is
+  marked lost after a grace period instead of leaving the task running forever.
+- Finished tasks are written to `<data>/tasks/<id>.json` and shown in the console
+  history after a restart.
+
+### Added — control-plane security
+
+- **Per-install CA and mutual TLS.** The master generates an ECDSA P-256 CA on first
+  start and issues each agent its own client certificate. Nothing is trusted from the
+  system root store, and TLS 1.3 is the only accepted protocol.
+- **One-time join tokens.** `-join` carries the master URL, an HMAC-SHA256 signed token
+  (expiry, default 30 minutes, single use via a recorded nonce) and the CA's SHA-256
+  fingerprint. The agent verifies that the presented chain root matches that
+  fingerprint *and* that the leaf was signed by it, so first contact cannot be
+  intercepted. A reused token, an expired token and a token signed by another master's
+  CA are all refused.
+- **Revocation that actually bites.** Revoking a node makes the control plane reject its
+  certificate immediately, and the registered serial is re-checked on every call, so a
+  superseded certificate stops working the moment it is renewed. Agents renew
+  themselves during the last 30 days of validity.
+- **Console hardening.** bcrypt password hash, HttpOnly + Secure + SameSite=Strict
+  session cookie, a CSRF header on every state-changing request, per-IP login
+  throttling with exponential lockout after 5 failures, a CSP with no inline script,
+  and an append-only JSONL audit log covering enrolment, rejected enrolments, token
+  issuance, revocation, logins and task lifecycle.
+- The console (HTML/CSS/JS) is embedded in the binary, so deployment is still one file.
+
+### Fixed — issues found while building distributed mode
+
+- **`fake-useragent` data race on the request path.** `browser.Android()` reads a
+  shared, unlocked `*rand.Rand`, so any run with more than one worker raced on it
+  (`go test -race` reproduces it; 0.10 and earlier are affected too). User agents are
+  now drawn from a pool built once at startup and the hot path no longer touches that
+  source.
+- **The master could not start with a fresh `-data` directory.** `admin.hash` was
+  written before the directory existed, so the first run died with
+  `open <dir>/.tmp-...: The system cannot find the path specified`.
+- **A task that ran its full duration was reported as `stopped`.** The master answers
+  "stop" when the deadline passes and the agent treated that as a manual interruption.
+  The progress reply now carries the reason (`deadline` vs `stopped`), and only the
+  latter marks a task stopped.
+- **Peak RPS was 0 on short tasks.** With one or two samples the master never got a
+  second counter to diff. The agent now closes each run with one final sample, and the
+  reported peak is never below the average.
+
 ## 0.10
 
 Everything below was reproduced against the previous build before being fixed, and is

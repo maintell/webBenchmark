@@ -3,7 +3,7 @@ http benchmark tool to ran out your server bandwidth.
 
 用户在使用本工具前请先查看授权及免责声明，webBenchmark仅仅是一个用于测试网页服务器性能的工具，用作其他用途，后果自负。
 
-Current version: 0.10 — see [CHANGELOG.md](CHANGELOG.md) for what changed.
+Current version: 0.11 — see [CHANGELOG.md](CHANGELOG.md) for what changed.
 
 - random User-Agent on every Request
 - customizable Referer Url,
@@ -19,6 +19,9 @@ Current version: 0.10 — see [CHANGELOG.md](CHANGELOG.md) for what changed.
   fine to connect and slow to transfer, and Go never falls back on slowness, so the
   default has to be the predictable one. Use `-6` only when you mean to test IPv6.
 - live status shows request count, failure count, downloaded bytes and average throughput.
+- **distributed mode**: one master with a web console drives many agents, with mTLS,
+  one-time join tokens and a per-install CA on the control plane. See
+  [Distributed mode](#distributed-mode).
 
 # Todo 
 - automatically tune concurrent routines to gain maximum performance. 
@@ -96,6 +99,131 @@ Asset names:
     ./webBenchmark_linux_x64 -s https://target.url -H 'regid:123' -H 'sign:Random10'
     # same, but open a fresh TCP connection for every request instead of reusing it
     ./webBenchmark_linux_x64 -s https://target.url -nr
+
+# Distributed mode
+
+One host runs out of its own NIC long before the target does. The same binary can act
+as a **master** (web console plus control plane) or as an **agent** (load generator).
+Agents only dial outwards; the master is the only process listening on a port.
+
+## Quick start
+
+    # 1. master: console and control plane share one TLS port
+    ./webBenchmark -master 0.0.0.0:8443
+
+    # 2. on every load generator, paste the join command printed by the master
+    ./webBenchmark -join wb1_eyJ2Ijo...
+
+    # 3. open https://<master>:8443, tick the nodes, fill in the target, run
+
+At startup the master prints the console URL, the CA fingerprint and a one-time join
+command. The console password is generated on first start and shown **once**; keep it,
+or pin your own with `-admin-password`.
+
+## How a task runs
+
+    browser ──HTTPS──▶ master ──start/stop──▶ agent(s) ──HTTP(S)──▶ target
+                        ▲                        │
+                        └──── progress/results ──┘
+
+- The master splits the requested total concurrency across the selected nodes
+  (`ceil(total / nodes)`, clamped to 1..256 per node) and sends every node the *same*
+  task spec plus its own shard size.
+- Agents poll for commands over a long poll (20 s window) and push a progress sample
+  every second: cumulative requests, failures, bytes and the last error.
+- The master derives rates from successive counters rather than from agent clocks, so
+  clock skew between machines cannot invent a throughput number. Totals are the sum of
+  the shards; peak RPS is never reported below the average.
+- A task ends at its duration, on the console's stop button, or when the master marks a
+  node as lost (no progress for 25 s past the deadline). The final state says which:
+  `done`, `stopped` or `degraded` (some nodes never reported).
+
+## Security model
+
+| Concern | Control |
+| --- | --- |
+| Transport | TLS 1.3 only, on every connection. Agents refuse to talk to anything that is not their pinned master. |
+| Cluster identity | The master generates its own ECDSA P-256 CA on first start. Nothing is trusted from the system root store. |
+| Agent identity | Each agent gets its own client certificate (90 days) signed by that CA; the master maps the certificate CN to a node record. |
+| Joining | One-time join token: HMAC-SHA256 signed, expiring (default 30 min), single use (nonce recorded). Guessing or reusing it does not work. |
+| First contact | The join credential carries the CA's SHA-256 fingerprint. The agent checks that the chain root matches that fingerprint *and* that the leaf was signed by it, so a man in the middle cannot enrol a fake master or read task traffic. |
+| Revocation | Revoking a node makes the master reject its certificate immediately, even though the certificate is still cryptographically valid. Certificates are also serial-checked, so a superseded certificate stops working as soon as it is renewed. |
+| Console auth | bcrypt password hash (`admin.hash`), HttpOnly + Secure + SameSite=Strict session cookie, a CSRF header on every state-changing call, and per-IP login throttling with exponential lockout after 5 failures. |
+| Secrets at rest | `ca.key`, `admin.hash`, `secret.key` and agent keys are written 0600 inside the data directory. The console password is never stored in plaintext. |
+| Audit | `audit.log` (JSONL) records enrolment, rejected enrolments, token issuance, revocations, logins, and every task start/stop/result. |
+| Blast radius | Agents listen on no port at all, so a compromised load generator cannot be used as a back door into the fleet. A task is limited to 64 nodes, 256 connections per node and 24 hours. |
+
+The console certificate is self-signed by that CA, so a browser will warn once. Either
+accept the warning or import `<data>/ca.crt` into the browser's trust store — the
+fingerprint printed at startup is what you compare against. When you reach the console
+through an address the master could not predict, add it with `-master-san 10.1.2.3`.
+
+## Operations
+
+| Path | Meaning |
+| --- | --- |
+| `<data>/ca.crt`, `ca.key` | Cluster trust root. Keep `ca.key` private; deleting it invalidates every enrolled node. |
+| `<data>/secret.key` | HMAC key for join tokens and sessions. Rotating it invalidates pending tokens and logins. |
+| `<data>/state.json` | Node registry and already used join-token nonces. |
+| `<data>/tasks/<id>.json` | Final result of every task, kept for the console history. |
+| `<data>/audit.log` | Append-only audit trail. |
+
+- Data directories default to `./webBenchmark-master` and `./webBenchmark-agent`; use
+  `-data` to relocate them.
+- An enrolled agent keeps its identity in its data directory: restarting it needs no new
+  token. Pointing an enrolled directory at a different master is refused instead of
+  silently re-enrolling.
+- Agents renew their own certificate in the last 30 days of validity; the old
+  certificate stops working the moment the new one is issued.
+- `-join-ttl` changes the token lifetime, `-node-name` sets the name shown in the console.
+
+## Distributed mode options
+
+    -master string
+          run as the master node (web console and agent control plane), e.g. -master 0.0.0.0:8443
+    -agent
+          run as an agent node and take tasks from the master
+    -join string
+          join credential printed by the master; implies -agent
+    -master-url string
+          master base url for agent mode, e.g. https://10.0.0.1:8443
+    -join-token string
+          one-time join token, alternative to -join
+    -ca-fingerprint string
+          master CA sha256 fingerprint, alternative to -join
+    -ca-cert string
+          path to the master ca.crt, used instead of -ca-fingerprint
+    -data string
+          state directory; defaults to ./webBenchmark-master or ./webBenchmark-agent
+    -node-name string
+          agent name shown in the console (default: hostname)
+    -admin-password string
+          master console password, at least 10 characters; a random one is generated when omitted
+    -master-san string
+          extra comma separated SANs for the master certificate (ip or dns name)
+    -join-ttl int
+          join token lifetime in minutes (default 30)
+
+## HTTP API
+
+The console is a thin client over the same API, so everything can be scripted. Admin
+calls need the session cookie from `POST /api/v1/login` plus the `X-WB-CSRF` header
+returned by it; agent calls need the client certificate.
+
+    POST /api/v1/enroll              join token + CSR  -> node id + client certificate
+    POST /api/v1/agent/poll          long poll for start/stop commands (also the heartbeat)
+    POST /api/v1/agent/progress      one sample per second; the reply says whether to stop
+    POST /api/v1/agent/result        final counters
+    POST /api/v1/agent/renew         rotate the client certificate
+    POST /api/v1/login               console password -> session cookie + CSRF token
+    GET  /api/v1/session             installation info, auth state, csrf token
+    GET  /api/v1/nodes               node list with online state and live rates
+    POST /api/v1/nodes/{id}/revoke   block a node permanently
+    GET  /api/v1/tasks               recent tasks (running first, then history)
+    POST /api/v1/tasks               create and dispatch a task
+    GET  /api/v1/tasks/{id}          live snapshot: totals, per-node rows, series
+    POST /api/v1/tasks/{id}/stop     stop a running task
+    POST /api/v1/join                issue a fresh join command for a given master url
 
 ## Behaviour notes
 

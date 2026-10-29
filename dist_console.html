@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>webBenchmark 主控台</title>
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+
+<section id="login" class="login" hidden>
+  <form id="login-form" autocomplete="off">
+    <h1>webBenchmark<span class="tag" id="login-ver"></span></h1>
+    <p class="muted">输入主控密码。密码只在首次启动时打印一次，本地只保存 bcrypt 哈希。</p>
+    <label for="password">主控密码</label>
+    <input id="password" type="password" autocomplete="current-password" required>
+    <button type="submit" class="primary">登录</button>
+    <p class="err" id="login-err" role="alert"></p>
+  </form>
+</section>
+
+<div id="app" hidden>
+  <header>
+    <span class="brand">webBenchmark</span>
+    <span class="tag" id="ver"></span>
+    <span class="grow"></span>
+    <span class="muted" id="node-summary"></span>
+    <button id="logout" class="ghost small" type="button">退出</button>
+  </header>
+
+  <main>
+    <section class="panel">
+      <div class="panel-head">
+        <h2>节点</h2>
+        <div class="actions">
+          <button id="select-all" class="ghost small" type="button">全选</button>
+          <button id="join-btn" class="small" type="button">加入命令</button>
+        </div>
+      </div>
+      <table class="grid" id="nodes-table">
+        <thead>
+          <tr>
+            <th class="w-check"></th>
+            <th>节点</th>
+            <th>状态</th>
+            <th class="num">RPS</th>
+            <th>版本</th>
+            <th class="num">最后心跳</th>
+            <th class="w-action"></th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+      <p class="empty" id="nodes-empty" hidden>还没有节点。点「加入命令」，把生成的命令粘贴到要压测的机器上执行。</p>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head"><h2>新建任务</h2></div>
+      <form id="task-form" class="form">
+        <div class="row">
+          <label class="col span2">目标 URL
+            <input name="target" type="text" placeholder="https://example.com/path" required>
+          </label>
+          <label class="col">时长（秒）
+            <input name="durationSec" type="number" min="1" max="86400" value="60" required>
+          </label>
+        </div>
+        <div class="row">
+          <label class="col">总并发
+            <input name="totalConc" type="number" min="1" max="16384" value="64" required>
+          </label>
+          <label class="col">协议
+            <select name="proto">
+              <option value="http1">http1</option>
+              <option value="http2">http2</option>
+              <option value="http3">http3</option>
+            </select>
+          </label>
+          <label class="col">每请求超时（秒）
+            <input name="timeoutSec" type="number" min="0" max="3600" value="30">
+          </label>
+        </div>
+        <div class="row checks">
+          <label class="check"><input type="checkbox" name="noReuse"> 每次新建连接</label>
+          <label class="check"><input type="checkbox" name="xforwardFor" checked> 随机 X-Forwarded-For</label>
+          <label class="check"><input type="checkbox" name="proxySpoof"> 伪造全部代理头</label>
+          <label class="check"><input type="checkbox" name="randomPost"> 随机 POST 体</label>
+          <label class="check"><input type="checkbox" name="ipv6"> 只用 IPv6</label>
+        </div>
+        <div class="row">
+          <label class="col span2">请求头（每行一条 <code>Name: Value</code>）
+            <textarea name="headers" rows="2" placeholder="Cookie: sid=abc"></textarea>
+          </label>
+        </div>
+        <div class="form-foot">
+          <span class="hint" id="plan-hint"></span>
+          <button type="submit" class="primary" id="start-btn">开始压测</button>
+        </div>
+        <p class="err" id="task-err" role="alert"></p>
+      </form>
+    </section>
+
+    <section class="panel" id="live-panel" hidden>
+      <div class="panel-head">
+        <h2>运行 <span class="chip" id="live-state"></span></h2>
+        <div class="actions"><button id="stop-btn" class="danger small" type="button" hidden>停止</button></div>
+      </div>
+      <p class="target" id="live-target"></p>
+      <div class="cards" id="live-cards"></div>
+      <canvas id="chart" height="150"></canvas>
+      <table class="grid" id="live-nodes">
+        <thead>
+          <tr>
+            <th>节点</th>
+            <th>状态</th>
+            <th class="num">并发</th>
+            <th class="num">RPS</th>
+            <th class="num">请求</th>
+            <th class="num">失败</th>
+            <th class="num">流量</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+      <p class="note" id="live-note"></p>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head"><h2>历史</h2></div>
+      <table class="grid clickable" id="history-table">
+        <thead>
+          <tr>
+            <th>目标</th>
+            <th>状态</th>
+            <th class="num">节点</th>
+            <th class="num">并发</th>
+            <th class="num">峰值 RPS</th>
+            <th class="num">请求</th>
+            <th class="num">流量</th>
+            <th>开始时间</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+      <p class="empty" id="history-empty" hidden>还没有任务记录。</p>
+    </section>
+  </main>
+</div>
+
+<dialog id="join-dialog">
+  <form method="dialog" class="dialog-body">
+    <h3>加入一台新节点</h3>
+    <label class="col">主控地址（从节点要能访问到）
+      <input id="join-url" type="text">
+    </label>
+    <p class="muted" id="join-exp"></p>
+    <pre id="join-cmd" class="cmd"></pre>
+    <div class="dialog-actions">
+      <button id="copy-join" class="ghost" type="button">复制命令</button>
+      <button class="primary" value="close">完成</button>
+    </div>
+    <p class="note">令牌只对一台机器有效，到期自动失效。节点身份保存在它的数据目录里，重启不需要重新加入。</p>
+  </form>
+</dialog>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

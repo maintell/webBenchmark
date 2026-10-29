@@ -18,11 +18,10 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/EDDYCJY/fake-useragent"
 	"github.com/apoorvam/goterminal"
 )
 
-const version = "0.10"
+const version = "0.11"
 
 type benchOptions struct {
 	postContent string
@@ -64,6 +63,20 @@ var (
 	customIP        ipArray
 	headers         headersList
 	targetURL       atomic.Value // string
+
+	// 分布式模式。主控只开一个 HTTPS 端口，从节点只向外连接。
+	masterListen      = flag.String("master", "", "run as the master node (web console + agent control plane), e.g. -master 0.0.0.0:8443")
+	agentFlag         = flag.Bool("agent", false, "run as an agent node and take tasks from the master")
+	joinString        = flag.String("join", "", "join credential printed by the master; implies -agent")
+	masterURL         = flag.String("master-url", "", "master base url for agent mode, e.g. https://10.0.0.1:8443")
+	joinToken         = flag.String("join-token", "", "one-time join token, alternative to -join")
+	caFingerprint     = flag.String("ca-fingerprint", "", "master CA sha256 fingerprint, alternative to -join")
+	caCertFile        = flag.String("ca-cert", "", "path to the master ca.crt, used instead of -ca-fingerprint")
+	distData          = flag.String("data", "", "state directory; defaults to ./webBenchmark-master or ./webBenchmark-agent")
+	nodeName          = flag.String("node-name", "", "agent name shown in the console (default: hostname)")
+	distAdminPassword = flag.String("admin-password", "", "master console password, at least 10 characters; a random one is generated when omitted")
+	masterSAN         = flag.String("master-san", "", "extra comma separated SANs for the master certificate (ip or dns name)")
+	joinTTLMin        = flag.Int("join-ttl", 30, "join token lifetime in minutes")
 )
 
 func setTargetURL(s string) {
@@ -284,7 +297,7 @@ func sendOnce(ctx context.Context, client *http.Client, opts *benchOptions, targ
 	}
 
 	request.Header.Set("Cookie", RandStringBytesMaskImpr(12))
-	request.Header.Set("User-Agent", browser.Android())
+	request.Header.Set("User-Agent", randomUserAgent())
 
 	requestReferer := opts.referer
 	if requestReferer == "" {
@@ -459,6 +472,10 @@ Examples:
       benchmark over QUIC, for servers that advertise http3 via Alt-Svc
   webBenchmark -s https://some.website -noprobe
       skip the startup protocol probe (it costs one extra request)
+  webBenchmark -master 0.0.0.0:8443
+      run the master: web console on https://<host>:8443 plus the agent control plane
+  webBenchmark -join wb1_xxxxx
+      run as an agent and join the cluster with the credential printed by the console
 
 `)
 }
@@ -573,6 +590,26 @@ func main() {
 	if err := validateFlags(); err != nil {
 		fmt.Fprintf(os.Stderr, "webBenchmark: %v\n", err)
 		os.Exit(2)
+	}
+
+	// 分布式模式在这里分流：主控与从节点都不需要 -s，也不能落到本机压测分支。
+	if err := validateDistFlags(); err != nil {
+		fmt.Fprintf(os.Stderr, "webBenchmark: %v\n", err)
+		os.Exit(2)
+	}
+	if *masterListen != "" {
+		if err := runMasterMode(); err != nil {
+			fmt.Fprintf(os.Stderr, "webBenchmark: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+	if agentModeRequested() {
+		if err := runAgentMode(); err != nil {
+			fmt.Fprintf(os.Stderr, "webBenchmark: %v\n", err)
+			os.Exit(1)
+		}
+		return
 	}
 
 	mode, err := parseProto(*protoFlag)

@@ -8,6 +8,7 @@ require (
 	github.com/miekg/dns v1.1.43
 	github.com/quic-go/quic-go v0.42.0
 	github.com/shirou/gopsutil v3.21.4+incompatible
+	golang.org/x/crypto v0.14.0
 	golang.org/x/term v0.21.0
 )
 
@@ -24,7 +25,6 @@ require (
 	github.com/tklauser/go-sysconf v0.3.6 // indirect
 	github.com/tklauser/numcpus v0.2.2 // indirect
 	go.uber.org/mock v0.4.0 // indirect
-	golang.org/x/crypto v0.14.0 // indirect
 	golang.org/x/exp v0.0.0-20221205204356-47842c84f3db // indirect
 	golang.org/x/mod v0.25.0 // indirect
 	golang.org/x/net v0.17.0 // indirect

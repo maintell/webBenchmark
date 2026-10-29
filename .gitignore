@@ -8,3 +8,7 @@ webBenchmark_x64.exe
 webBenchmark_bsd_x64.exe
 *.test
 *.out
+
+# distributed mode state (CA keys, node registry, task history, audit log)
+webBenchmark-master/
+webBenchmark-agent/
