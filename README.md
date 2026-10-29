@@ -176,6 +176,8 @@ through an address the master could not predict, add it with `-master-san 10.1.2
 - Agents renew their own certificate in the last 30 days of validity; the old
   certificate stops working the moment the new one is issued.
 - `-join-ttl` changes the token lifetime, `-node-name` sets the name shown in the console.
+- `-admin-password` is handy for automation but ends up in the process list; prefer the
+  generated password shown once at first start, and use the flag only to reset it.
 
 ## Distributed mode options
 
