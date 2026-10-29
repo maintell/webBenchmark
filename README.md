@@ -229,6 +229,26 @@ Requires Go 1.21 or newer.
 Cross compile all targets at once with `build.bat` (windows shell), which produces the
 four binaries listed above.
 
+## Release
+
+**All quality gates run locally; the pipeline only compiles and publishes.** Nothing is
+built on a branch push or a pull request — a release starts only from a version tag, and a
+single job produces all four binaries.
+
+    pwsh ./scripts/preflight.ps1 -Tag 0.10   # gofmt, vet, test, race, four targets, docs
+    git tag 0.10 && git push origin 0.10      # this is the release
+
+The preflight script refuses to pass when the working tree is dirty, when any file needs
+gofmt, when vet or the tests fail, when any target does not compile, when `CHANGELOG.md`
+has no `## <version>` section, when the README version line is stale, or when a flag
+exists in the code but is missing from the flag table in this file.
+
+The workflow then re-checks three things before it publishes, because a mismatched
+release is worse than no release: the tag must exist, it must equal `const version` in
+`main.go`, and it must have a matching changelog section. It attaches the four binaries
+plus `SHA256SUMS` and uses the changelog section as the release notes. Re-running it for
+an existing tag refreshes the assets instead of failing.
+
 ## LICENSE AND DISCLAIMER
 
 

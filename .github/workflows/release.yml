@@ -1,0 +1,101 @@
+name: Release
+
+# 发版的唯一入口是版本 tag（本仓库约定为裸版本号，如 0.10）。
+# 手动派发只作为补救手段，必须指向一个已经存在的 tag。
+# 分支推送和 PR 都不会启动这里：格式、vet、测试、四平台编译、文档一致性
+# 全部在本地由 scripts/preflight.ps1 完成之后才打 tag。
+on:
+  push:
+    tags:
+      - "[0-9]*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "已存在的版本 tag，例如 0.10"
+        required: true
+
+# 固定并发组：tag 推送与手动派发共用一组，避免两条流水线并行抢同一批资产。
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+    steps:
+      - name: Checkout the release tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+          fetch-depth: 0
+
+      - name: Validate tag, version and changelog
+        run: |
+          set -euo pipefail
+          git rev-parse "refs/tags/$TAG" >/dev/null 2>&1 || {
+            echo "::error::tag $TAG does not exist"; exit 1; }
+
+          version=$(sed -n 's/^const version = "\(.*\)"$/\1/p' main.go)
+          if [ "$version" != "$TAG" ]; then
+            echo "::error::main.go declares version '$version' but the tag is '$TAG'"; exit 1
+          fi
+
+          grep -qx "## $TAG" CHANGELOG.md || {
+            echo "::error::CHANGELOG.md has no '## $TAG' section"; exit 1; }
+
+          echo "tag $TAG matches main.go and CHANGELOG.md"
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build every target
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          build() {
+            echo "building $4"
+            CGO_ENABLED=0 GOOS="$1" GOARCH="$2" go build -trimpath -ldflags "-s -w" -o "dist/$4" .
+          }
+          build linux   amd64 webBenchmark_linux_x64
+          build linux   arm   webBenchmark_linux_arm
+          build windows amd64 webBenchmark_x64.exe
+          build freebsd amd64 webBenchmark_bsd_x64.exe
+          ( cd dist && sha256sum * > SHA256SUMS )
+          ls -l dist
+
+      - name: Extract release notes from the changelog
+        run: |
+          set -euo pipefail
+          awk -v tag="$TAG" '
+            $0 == "## " tag { found = 1; next }
+            found && /^## / { exit }
+            found { print }
+          ' CHANGELOG.md > notes.md
+          if [ ! -s notes.md ]; then
+            echo "See CHANGELOG.md for details." > notes.md
+          fi
+          cat notes.md
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "release $TAG already exists, refreshing its assets"
+            gh release upload "$TAG" dist/* --clobber
+          else
+            gh release create "$TAG" dist/* \
+              --title "$TAG" \
+              --notes-file notes.md \
+              --verify-tag
+          fi
+          gh release view "$TAG" --json tagName,url,assets \
+            --jq '"\(.tagName) \(.url)", (.assets[] | "  \(.name) \(.size) bytes")'

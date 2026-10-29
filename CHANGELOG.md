@@ -152,6 +152,12 @@ covered by regression tests in `*_test.go`.
 
 ### Changed
 
+- **Releases are built by a GitHub Actions workflow from a version tag.** It builds all
+  four targets in one job, attaches them with `SHA256SUMS`, and uses the matching
+  changelog section as the release notes. There is no PR or branch trigger: formatting,
+  vet, tests, race, the four cross builds and the documentation checks all run locally via
+  `scripts/preflight.ps1` before a tag is pushed. The workflow still refuses to publish if
+  the tag, `const version` in `main.go`, and the changelog section disagree.
 - Adds `github.com/quic-go/quic-go` (pinned to v0.42.0) for HTTP/3. The module stays on
   Go 1.21; newer quic-go releases would push the floor to 1.26.
 - Terminal output now writes explicit `\r\n`. Reading keys requires raw mode, which turns
