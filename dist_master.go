@@ -35,9 +35,6 @@ type masterOptions struct {
 	JoinTTL   time.Duration
 	AdminHash []byte
 	MaxNodes  int
-	// PollWait 是从节点长轮询的等待窗口。留空用 distPollWait；
-	// 测试把它调短，否则每个"没有命令"的断言都要白等 20 秒。
-	PollWait time.Duration
 }
 
 // master 是主控节点：持有信任根、节点注册表、任务运行态和控制台 HTTP 服务。
@@ -53,7 +50,6 @@ type master struct {
 	adminHash  []byte
 	joinTTL    time.Duration
 	maxNodes   int
-	pollWait   time.Duration
 	sessions   *sessionStore
 	login      *rateLimiter
 	enroll     *rateLimiter
@@ -85,8 +81,8 @@ type nodeRuntime struct {
 	cpus       int
 	remoteAddr string
 	running    string
-	pending    []Command
-	notify     chan struct{}
+	// conn 非空即在线。命令直接写进这条连接，不再有"待发队列 + 长轮询"。
+	conn *agentConn
 }
 
 type shardRuntime struct {
@@ -203,9 +199,6 @@ func newMaster(opts masterOptions) (*master, error) {
 	if opts.MaxNodes <= 0 {
 		opts.MaxNodes = distMaxNodes
 	}
-	if opts.PollWait <= 0 {
-		opts.PollWait = distPollWait
-	}
 	p, err := newPKI(opts.Dir)
 	if err != nil {
 		return nil, err
@@ -214,7 +207,6 @@ func newMaster(opts masterOptions) (*master, error) {
 	if err != nil {
 		return nil, err
 	}
-	pool := p.caPool()
 	audit, err := newAuditLog(filepath.Join(opts.Dir, "audit.log"))
 	if err != nil {
 		return nil, err
@@ -226,7 +218,6 @@ func newMaster(opts masterOptions) (*master, error) {
 		adminHash:  opts.AdminHash,
 		joinTTL:    opts.JoinTTL,
 		maxNodes:   opts.MaxNodes,
-		pollWait:   opts.PollWait,
 		sessions:   newSessionStore(distSessionTTL),
 		login:      newRateLimiter(20, 5*time.Minute),
 		enroll:     newRateLimiter(10, time.Minute),
@@ -237,14 +228,10 @@ func newMaster(opts masterOptions) (*master, error) {
 		usedTokens: make(map[string]int64),
 		tlsConfig: &tls.Config{
 			Certificates: []tls.Certificate{cert},
-			// 只上 TLS 1.3：这套控制面只服务本工具自己的从节点和现代浏览器，
-			// 没有任何理由为了兼容旧客户端把协议降到 1.2。
+			// 只上 TLS 1.3：这套控制面只服务本工具自己的从节点和现代浏览器。
 			MinVersion: tls.VersionTLS13,
-			// 浏览器不带客户端证书，从节点必须带。带了的必须验通过，
-			// 否则握手就失败——不会出现"证书坏了但请求照进"的中间态。
-			ClientAuth: tls.VerifyClientCertIfGiven,
-			ClientCAs:  pool,
-			NextProtos: []string{"h2", "http/1.1"},
+			// 不要求客户端证书：身份认证已经下沉到应用层握手（见 dist_secure.go），
+			// 这样挂在 TLS 终止代理后面时也不会因为"证书到不了进程"而失效。
 		},
 	}
 	if err := m.loadState(); err != nil {
@@ -261,13 +248,13 @@ func (m *master) close() {
 	}
 }
 
-// publicURL 给出加入命令里默认填写的主控地址。
+// masterPublicURL 给出加入命令里默认填写的主控地址。
 // 监听在 0.0.0.0 时无法知道运维会从哪个地址访问，用主机名做最佳猜测，
 // 控制台里允许改成实际可达的地址。
-func masterPublicURL(bind string) string {
+func masterPublicURL(scheme, bind string) string {
 	host, port, err := net.SplitHostPort(bind)
 	if err != nil {
-		return "https://" + bind
+		return scheme + "://" + bind
 	}
 	switch host {
 	case "", "0.0.0.0", "::", "[::]":
@@ -277,7 +264,7 @@ func masterPublicURL(bind string) string {
 			host = "127.0.0.1"
 		}
 	}
-	return "https://" + net.JoinHostPort(host, port)
+	return scheme + "://" + net.JoinHostPort(host, port)
 }
 
 // ---------- 状态持久化 ----------
@@ -318,7 +305,6 @@ func (m *master) loadState() error {
 			enrolledAt: n.EnrolledAt,
 			revoked:    n.Revoked,
 			revokedAt:  n.RevokedAt,
-			notify:     make(chan struct{}, 1),
 		}
 	}
 	for nonce, exp := range st.UsedTokens {
@@ -453,8 +439,6 @@ func (m *master) handleIndex(w http.ResponseWriter, r *http.Request) {
 func (m *master) handleAPI(w http.ResponseWriter, r *http.Request) {
 	path := strings.TrimSuffix(r.URL.Path, "/")
 	switch {
-	case path == "/api/v1/enroll":
-		m.handleEnroll(w, r)
 	case path == "/api/v1/login":
 		m.handleLogin(w, r)
 	case path == "/api/v1/logout":
@@ -471,35 +455,36 @@ func (m *master) handleAPI(w http.ResponseWriter, r *http.Request) {
 		m.handleTaskAction(w, r, strings.TrimPrefix(path, "/api/v1/tasks/"))
 	case path == "/api/v1/join":
 		m.handleJoin(w, r)
-	case path == "/api/v1/agent/poll":
-		m.handleAgentPoll(w, r)
-	case path == "/api/v1/agent/progress":
-		m.handleAgentProgress(w, r)
-	case path == "/api/v1/agent/result":
-		m.handleAgentResult(w, r)
-	case path == "/api/v1/agent/renew":
-		m.handleAgentRenew(w, r)
+	case path == "/api/v1/ssh/install":
+		m.handleSSHInstall(w, r)
+	case path == "/api/v1/ssh/probe":
+		m.handleSSHProbe(w, r)
+	case path == "/api/v1/agent/ws":
+		// 主从之间唯一的入口：一条加密的双向 WebSocket。
+		m.handleAgentWS(w, r)
 	default:
 		writeError(w, http.StatusNotFound, "未知接口")
 	}
 }
 
-// serve 在已绑定的监听器上提供 TLS 服务。
+// serve 在已绑定的监听器上提供服务。tlsConf 为 nil 表示纯 http（运维显式选择）。
 // 监听放在调用方是为了先拿到端口、再打印"可用的地址"，端口冲突时不会误导运维。
-func (m *master) serve(ctx context.Context, ln net.Listener) error {
+func (m *master) serve(ctx context.Context, ln net.Listener, tlsConf *tls.Config) error {
 	srv := &http.Server{
 		Handler:           m.handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
-		// 长轮询最长等 20 秒，写超时必须比它大，否则命令还没发出连接就被关了。
+		// WebSocket 是长连接，靠自身心跳存活；这里只兜住普通请求。
 		WriteTimeout:   60 * time.Second,
 		IdleTimeout:    120 * time.Second,
 		MaxHeaderBytes: 32 << 10,
 		ErrorLog:       nil,
 	}
-	tlsLn := tls.NewListener(ln, m.tlsConfig)
+	if tlsConf != nil {
+		ln = tls.NewListener(ln, tlsConf)
+	}
 	errCh := make(chan error, 1)
-	go func() { errCh <- srv.Serve(tlsLn) }()
+	go func() { errCh <- srv.Serve(ln) }()
 
 	select {
 	case err := <-errCh:
@@ -508,6 +493,9 @@ func (m *master) serve(ctx context.Context, ln net.Listener) error {
 		}
 		return err
 	case <-ctx.Done():
+		// 已升级（hijacked）的 WebSocket 不在 Shutdown 的管理范围内，
+		// 必须先主动断开，否则主控退出会卡满一个读超时。
+		m.closeAgentConns()
 		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		_ = srv.Shutdown(shutCtx)
@@ -516,305 +504,14 @@ func (m *master) serve(ctx context.Context, ln net.Listener) error {
 }
 
 // ---------- 节点入网与控制面 ----------
-
-func (m *master) handleEnroll(w http.ResponseWriter, r *http.Request) {
-	if !requireMethod(w, r, http.MethodPost) {
-		return
-	}
-	ip := clientIP(r)
-	if !m.enroll.allow(ip) {
-		writeError(w, http.StatusTooManyRequests, "加入申请过于频繁，请稍后再试")
-		return
-	}
-	var req enrollRequest
-	if err := decodeJSONBody(w, r, &req); err != nil {
-		return
-	}
-	pl, err := m.pki.verifyJoinToken(req.Token)
-	if err != nil {
-		m.audit.event("enroll_rejected", map[string]any{"ip": ip, "reason": err.Error()})
-		writeError(w, http.StatusForbidden, "加入令牌无效或已过期，请在主控控制台重新签发")
-		return
-	}
-	if strings.TrimSpace(req.CSR) == "" {
-		writeError(w, http.StatusBadRequest, "缺少 CSR")
-		return
-	}
-
-	// 单次使用：先占住 nonce 再签发。放在同一个临界区里，
-	// 两个并发请求就不可能同时通过（否则一个令牌能入网两台机器）。
-	now := time.Now()
-	m.mu.Lock()
-	if _, used := m.usedTokens[pl.Nonce]; used {
-		m.mu.Unlock()
-		m.audit.event("enroll_replay", map[string]any{"ip": ip})
-		writeError(w, http.StatusForbidden, "加入令牌已被使用")
-		return
-	}
-	if len(m.nodes) >= m.maxNodes {
-		m.mu.Unlock()
-		writeError(w, http.StatusForbidden, "节点数量已达上限")
-		return
-	}
-	m.usedTokens[pl.Nonce] = pl.Exp
-	m.pruneTokensLocked(now)
-	m.mu.Unlock()
-
-	nodeID := "node-" + randomHex(4)
-	certPEM, serial, err := m.pki.issueClientCert(req.CSR, nodeID)
-	if err != nil {
-		m.mu.Lock()
-		delete(m.usedTokens, pl.Nonce)
-		m.mu.Unlock()
-		m.audit.event("enroll_rejected", map[string]any{"ip": ip, "reason": err.Error()})
-		writeError(w, http.StatusBadRequest, "CSR 无效："+err.Error())
-		return
-	}
-
-	m.mu.Lock()
-	m.nodes[nodeID] = &nodeRuntime{
-		id:         nodeID,
-		name:       sanitizeNodeName(req.Name),
-		serial:     serial,
-		enrolledAt: now,
-		lastSeen:   now,
-		version:    sanitizeNodeName(req.Version),
-		os:         sanitizeNodeName(req.OS),
-		arch:       sanitizeNodeName(req.Arch),
-		cpus:       req.CPUs,
-		remoteAddr: ip,
-		notify:     make(chan struct{}, 1),
-	}
-	m.persistLocked()
-	m.mu.Unlock()
-
-	m.audit.event("enroll", map[string]any{
-		"node": nodeID, "name": sanitizeNodeName(req.Name), "ip": ip,
-		"version": req.Version, "serial": serial,
-	})
-	writeJSON(w, http.StatusOK, enrollResponse{
-		NodeID:     nodeID,
-		CertPEM:    string(certPEM),
-		CAPEM:      string(m.pki.certPEM),
-		ServerTime: time.Now().UTC(),
-	})
-}
-
-// agentNodeID 校验客户端证书并把请求绑定到一个已注册、未吊销的节点。
-// 注意 TLS 层只保证"证书链有效"；"这个节点还活着、没被吊销、证书没被换过"
-// 是应用层必须自己回答的问题。
-func (m *master) agentNodeID(w http.ResponseWriter, r *http.Request) (string, bool) {
-	if r.TLS == nil || len(r.TLS.PeerCertificates) == 0 || len(r.TLS.VerifiedChains) == 0 {
-		writeError(w, http.StatusUnauthorized, "需要有效的客户端证书")
-		return "", false
-	}
-	cert := r.TLS.PeerCertificates[0]
-	id := cert.Subject.CommonName
-	m.mu.Lock()
-	n := m.nodes[id]
-	if n == nil {
-		m.mu.Unlock()
-		writeError(w, http.StatusForbidden, "节点未注册，请重新加入集群")
-		return "", false
-	}
-	if n.revoked {
-		m.mu.Unlock()
-		writeError(w, http.StatusForbidden, "节点已被吊销")
-		return "", false
-	}
-	// 证书序列号与登记值不一致，说明该节点换过证书（或是旧证书被复制到了别处）。
-	if n.serial != cert.SerialNumber.Text(16) {
-		m.mu.Unlock()
-		writeError(w, http.StatusForbidden, "证书已失效，请重新加入集群")
-		return "", false
-	}
-	m.mu.Unlock()
-	return id, true
-}
-
-func (m *master) handleAgentPoll(w http.ResponseWriter, r *http.Request) {
-	if !requireMethod(w, r, http.MethodPost) {
-		return
-	}
-	nodeID, ok := m.agentNodeID(w, r)
-	if !ok {
-		return
-	}
-	var req pollRequest
-	if err := decodeJSONBody(w, r, &req); err != nil {
-		return
-	}
-	if req.Proto != distProtoVersion {
-		writeError(w, http.StatusConflict, fmt.Sprintf(
-			"协议版本不一致：主控 %d，节点 %d，请让主从使用同一版本的可执行文件",
-			distProtoVersion, req.Proto))
-		return
-	}
-	m.touchNode(nodeID, req, clientIP(r))
-
-	deadline := time.Now().Add(m.pollWait)
-	for {
-		cmd, notify, alive := m.takeCommand(nodeID)
-		if !alive {
-			writeError(w, http.StatusForbidden, "节点不可用")
-			return
-		}
-		if cmd != nil {
-			writeJSON(w, http.StatusOK, pollResponse{Command: cmd, ServerTime: time.Now().UTC()})
-			return
-		}
-		remain := time.Until(deadline)
-		if remain <= 0 {
-			writeJSON(w, http.StatusOK, pollResponse{ServerTime: time.Now().UTC()})
-			return
-		}
-		timer := time.NewTimer(remain)
-		select {
-		case <-notify:
-		case <-timer.C:
-		case <-r.Context().Done():
-		}
-		timer.Stop()
-	}
-}
-
-func (m *master) handleAgentProgress(w http.ResponseWriter, r *http.Request) {
-	if !requireMethod(w, r, http.MethodPost) {
-		return
-	}
-	nodeID, ok := m.agentNodeID(w, r)
-	if !ok {
-		return
-	}
-	var p Progress
-	if err := decodeJSONBody(w, r, &p); err != nil {
-		return
-	}
-	stop, byDeadline, known := m.applyProgress(nodeID, p)
-	reason := ""
-	switch {
-	case !stop:
-	case byDeadline:
-		reason = "deadline"
-	default:
-		reason = "stopped"
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"known": known, "stop": stop, "reason": reason})
-}
-
-func (m *master) handleAgentResult(w http.ResponseWriter, r *http.Request) {
-	if !requireMethod(w, r, http.MethodPost) {
-		return
-	}
-	nodeID, ok := m.agentNodeID(w, r)
-	if !ok {
-		return
-	}
-	var res TaskResult
-	if err := decodeJSONBody(w, r, &res); err != nil {
-		return
-	}
-	m.applyResult(nodeID, res)
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
-}
-
-func (m *master) handleAgentRenew(w http.ResponseWriter, r *http.Request) {
-	if !requireMethod(w, r, http.MethodPost) {
-		return
-	}
-	nodeID, ok := m.agentNodeID(w, r)
-	if !ok {
-		return
-	}
-	var req renewRequest
-	if err := decodeJSONBody(w, r, &req); err != nil {
-		return
-	}
-	certPEM, serial, err := m.pki.issueClientCert(req.CSR, nodeID)
-	if err != nil {
-		m.audit.event("renew_rejected", map[string]any{"node": nodeID, "reason": err.Error()})
-		writeError(w, http.StatusBadRequest, "CSR 无效："+err.Error())
-		return
-	}
-	m.mu.Lock()
-	if n := m.nodes[nodeID]; n != nil {
-		n.serial = serial
-		n.lastSeen = time.Now()
-		m.persistLocked()
-	}
-	m.mu.Unlock()
-	m.audit.event("renew", map[string]any{"node": nodeID, "serial": serial})
-	writeJSON(w, http.StatusOK, renewResponse{
-		NodeID:     nodeID,
-		CertPEM:    string(certPEM),
-		ExpiresAt:  time.Now().Add(distAgentCertTTL).UTC(),
-		ServerTime: time.Now().UTC(),
-	})
-}
-
-func (m *master) touchNode(nodeID string, req pollRequest, ip string) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	n := m.nodes[nodeID]
-	if n == nil {
-		return
-	}
-	n.lastSeen = time.Now()
-	n.remoteAddr = ip
-	n.running = sanitizeNodeName(req.Running)
-	if v := sanitizeNodeName(req.Version); v != "" {
-		n.version = v
-	}
-	if v := sanitizeNodeName(req.OS); v != "" {
-		n.os = v
-	}
-	if v := sanitizeNodeName(req.Arch); v != "" {
-		n.arch = v
-	}
-	if req.CPUs > 0 {
-		n.cpus = req.CPUs
-	}
-}
-
-func (m *master) takeCommand(nodeID string) (*Command, <-chan struct{}, bool) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	n := m.nodes[nodeID]
-	if n == nil || n.revoked {
-		return nil, nil, false
-	}
-	if len(n.pending) == 0 {
-		return nil, n.notify, true
-	}
-	cmd := n.pending[0]
-	n.pending = n.pending[1:]
-	return &cmd, n.notify, true
-}
-
-// enqueueLocked 把命令排进节点的待发队列并唤醒它的长轮询。
-// 调用方必须持有 m.mu。
-func (m *master) enqueueLocked(nodeID string, cmd Command) {
-	n := m.nodes[nodeID]
-	if n == nil || n.revoked {
-		return
-	}
-	for _, p := range n.pending {
-		if p.Kind == cmd.Kind && p.TaskID == cmd.TaskID {
-			return // 同一条命令只排一次，避免重复 start/stop
-		}
-	}
-	n.pending = append(n.pending, cmd)
-	if len(n.pending) > 32 {
-		n.pending = n.pending[len(n.pending)-32:]
-	}
-	select {
-	case n.notify <- struct{}{}:
-	default:
-	}
-}
+//
+// 入网、心跳、命令、进度、结果、换证现在全部走 /api/v1/agent/ws 一条加密连接，
+// 具体实现见 dist_agentapi.go 与 dist_secure.go。
 
 func (m *master) nodeOnlineLocked(n *nodeRuntime) bool {
-	return n != nil && !n.revoked && !n.lastSeen.IsZero() && time.Since(n.lastSeen) <= distOfflineAfter
+	// 在线 = 有一条活着的会话。心跳只用来刷新元数据与"多久没动静"的展示，
+	// 不再参与判定：连接断了就是离线，没有中间态。
+	return n != nil && !n.revoked && n.conn != nil
 }
 
 func (m *master) busyTaskLocked(nodeID string) string {
@@ -836,23 +533,25 @@ func (m *master) busyTaskLocked(nodeID string) string {
 // byDeadline 必须和"人工停止"分开：任务到点时主控自己也会回 stop，
 // 如果节点把它当成被叫停，一条跑满时长的正常任务会被标成 stopped，
 // 控制台上的历史就会变成一片"已停止"。
-func (m *master) applyProgress(nodeID string, p Progress) (stop, byDeadline, known bool) {
+// applyProgress 收下一帧进度。
+//
+// 是否要停不再由这一帧回答：主控的看门狗在到点或人工停止时主动下发 stop，
+// 节点自己也知道时长，两边各有一份判据，网络抖动不会把正常完成判成中断。
+func (m *master) applyProgress(nodeID string, p Progress) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	t := m.tasks[p.TaskID]
 	if t == nil || t.finalized {
-		return true, false, false
+		return
 	}
 	sh := t.shards[nodeID]
 	if sh == nil {
-		return true, false, false
+		return
 	}
 	now := time.Now()
 	// 同一 seq 或更旧的包直接忽略：重传、乱序都不该让速率算出负数。
 	if p.Seq <= sh.seq {
-		userStop := t.state != taskRunning
-		expired := !userStop && now.After(t.endsAt)
-		return userStop || expired, expired, true
+		return
 	}
 	sh.seq = p.Seq
 	if !sh.prevAt.IsZero() {
@@ -876,9 +575,6 @@ func (m *master) applyProgress(nodeID string, p Progress) (stop, byDeadline, kno
 		sh.state = shardRunning
 	}
 	m.appendPointLocked(t, now)
-	userStop := t.state != taskRunning
-	expired := !userStop && now.After(t.endsAt)
-	return userStop || expired, expired, true
 }
 
 func (m *master) applyResult(nodeID string, res TaskResult) {
@@ -962,7 +658,7 @@ func (m *master) createTask(req taskCreateRequest, by string) (taskView, error) 
 			}
 			if !m.nodeOnlineLocked(n) {
 				m.mu.Unlock()
-				return taskView{}, fmt.Errorf("节点 %s 不在线（最后心跳超过 %s）", id, distOfflineAfter)
+				return taskView{}, fmt.Errorf("节点 %s 不在线（没有活跃连接）", id)
 			}
 			if busy := m.busyTaskLocked(id); busy != "" {
 				m.mu.Unlock()
@@ -973,7 +669,7 @@ func (m *master) createTask(req taskCreateRequest, by string) (taskView, error) 
 	}
 	if len(ids) == 0 {
 		m.mu.Unlock()
-		return taskView{}, fmt.Errorf("没有可用节点：请先让从节点加入，且保持心跳在 %s 内", distOfflineAfter)
+		return taskView{}, fmt.Errorf("没有可用节点：请先让从节点加入并保持连接")
 	}
 	if len(ids) > distMaxNodesPerTask {
 		ids = ids[:distMaxNodesPerTask]
@@ -1002,8 +698,16 @@ func (m *master) createTask(req taskCreateRequest, by string) (taskView, error) 
 	// 否则控制台在任务开始后的第一秒里是一张空图。
 	for _, id := range ids {
 		t.shards[id] = &shardRuntime{nodeID: id, conc: per, state: shardAssigned, lastAt: now}
+	}
+	for _, id := range ids {
 		dispatch := spec
-		m.enqueueLocked(id, Command{Kind: cmdStart, TaskID: spec.ID, Spec: &dispatch})
+		if !m.enqueueLocked(id, wsControl{T: "start", TaskID: spec.ID, Spec: &dispatch}) {
+			// 连接刚好在这两步之间断开：这个分片注定收不到结果，
+			// 直接判 lost，让任务能正常收尾而不是挂到超时。
+			sh := t.shards[id]
+			sh.state = shardLost
+			sh.lastError = "节点连接已断开"
+		}
 	}
 	m.tasks[spec.ID] = t
 	m.order = append(m.order, spec.ID)
@@ -1043,7 +747,11 @@ func (m *master) watchTask(t *taskRuntime) {
 					continue
 				}
 				if (t.state != taskRunning || now.After(t.endsAt)) && !sh.stopSent {
-					m.enqueueLocked(id, Command{Kind: cmdStop, TaskID: t.spec.ID})
+					reason := "deadline"
+					if t.state != taskRunning {
+						reason = "stopped"
+					}
+					m.enqueueLocked(id, wsControl{T: "stop", TaskID: t.spec.ID, Reason: reason})
 					sh.stopSent = true
 				}
 				if now.After(stopDeadline) {
@@ -1133,7 +841,7 @@ func (m *master) stopTask(id, by string) error {
 		if shardTerminal(sh.state) || sh.stopSent {
 			continue
 		}
-		m.enqueueLocked(nodeID, Command{Kind: cmdStop, TaskID: id})
+		m.enqueueLocked(nodeID, wsControl{T: "stop", TaskID: id, Reason: "stopped"})
 		sh.stopSent = true
 	}
 	m.audit.event("task_stop", map[string]any{"task": id, "by": by})
@@ -1268,7 +976,9 @@ func (m *master) handleLogin(w http.ResponseWriter, r *http.Request) {
 		Value:    token,
 		Path:     "/",
 		HttpOnly: true,
-		Secure:   true,
+		// 只在 TLS 下发 Secure：http 模式下带 Secure 的 Cookie 浏览器根本不会保存，
+		// 表现就是"输入正确密码后仍停在登录页"。
+		Secure:   r.TLS != nil,
 		SameSite: http.SameSiteStrictMode,
 		MaxAge:   int(distSessionTTL.Seconds()),
 	})
@@ -1288,7 +998,7 @@ func (m *master) handleLogout(w http.ResponseWriter, r *http.Request) {
 	}
 	http.SetCookie(w, &http.Cookie{
 		Name: distSessionCookie, Value: "", Path: "/",
-		HttpOnly: true, Secure: true, SameSite: http.SameSiteStrictMode, MaxAge: -1,
+		HttpOnly: true, Secure: r.TLS != nil, SameSite: http.SameSiteStrictMode, MaxAge: -1,
 	})
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
@@ -1403,9 +1113,15 @@ func (m *master) handleNodeAction(w http.ResponseWriter, r *http.Request, rest s
 	}
 	n.revoked = true
 	n.revokedAt = time.Now()
-	n.pending = nil
+	// 吊销要当场生效：把连接也断掉，节点下一次重连就会在握手阶段被拒绝，
+	// 而不是继续用一条已经建立的会话收发命令。
+	conn := n.conn
+	n.conn = nil
 	m.persistLocked()
 	m.mu.Unlock()
+	if conn != nil {
+		conn.close()
+	}
 
 	m.audit.event("node_revoke", map[string]any{"node": id, "ip": clientIP(r)})
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
@@ -1538,8 +1254,8 @@ func (m *master) newJoin(rawURL string) (joinInfo, error) {
 	if rawURL == "" {
 		return joinInfo{}, fmt.Errorf("缺少主控地址")
 	}
-	if !strings.HasPrefix(rawURL, "https://") {
-		return joinInfo{}, fmt.Errorf("主控地址必须以 https:// 开头")
+	if !strings.HasPrefix(rawURL, "https://") && !strings.HasPrefix(rawURL, "http://") {
+		return joinInfo{}, fmt.Errorf("主控地址必须以 http:// 或 https:// 开头")
 	}
 	rawURL = strings.TrimSuffix(rawURL, "/")
 	tok, pl, err := m.pki.newJoinToken(m.joinTTL)

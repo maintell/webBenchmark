@@ -3,7 +3,7 @@ http benchmark tool to ran out your server bandwidth.
 
 用户在使用本工具前请先查看授权及免责声明，webBenchmark仅仅是一个用于测试网页服务器性能的工具，用作其他用途，后果自负。
 
-Current version: 0.11 — see [CHANGELOG.md](CHANGELOG.md) for what changed.
+Current version: 0.12 — see [CHANGELOG.md](CHANGELOG.md) for what changed.
 
 - random User-Agent on every Request
 - customizable Referer Url,
@@ -19,9 +19,9 @@ Current version: 0.11 — see [CHANGELOG.md](CHANGELOG.md) for what changed.
   fine to connect and slow to transfer, and Go never falls back on slowness, so the
   default has to be the predictable one. Use `-6` only when you mean to test IPv6.
 - live status shows request count, failure count, downloaded bytes and average throughput.
-- **distributed mode**: one master with a web console drives many agents, with mTLS,
-  one-time join tokens and a per-install CA on the control plane. See
-  [Distributed mode](#distributed-mode).
+- **distributed mode**: one master with a web console drives many agents over a single
+  end-to-end encrypted WebSocket, with one-time join tokens, a per-install CA, plain
+  http or https, and optional SSH auto-install. See [Distributed mode](#distributed-mode).
 
 # Todo 
 - automatically tune concurrent routines to gain maximum performance. 
@@ -106,15 +106,22 @@ One host runs out of its own NIC long before the target does. The same binary ca
 as a **master** (web console plus control plane) or as an **agent** (load generator).
 Agents only dial outwards; the master is the only process listening on a port.
 
+The master speaks plain **http** or **https**, your choice. The agent channel is a single
+encrypted WebSocket either way — see [Security model](#security-model) for why that is
+not the same as "https only".
+
 ## Quick start
 
-    # 1. master: console and control plane share one TLS port
-    ./webBenchmark -master 0.0.0.0:8443
+    # 1. master: console and control plane on one port
+    ./webBenchmark -master 0.0.0.0:8443             # https, self signed (default)
+    ./webBenchmark -master http://0.0.0.0:8080      # plain http, e.g. behind a tls proxy
 
-    # 2. on every load generator, paste the join command printed by the master
+    # 2a. on a load generator, paste the join command printed by the master
     ./webBenchmark -join wb1_eyJ2Ijo...
 
-    # 3. open https://<master>:8443, tick the nodes, fill in the target, run
+    # 2b. or let the master install them over ssh: console -> "SSH 安装"
+
+    # 3. open the console, tick the nodes, fill in the target, run
 
 At startup the master prints the console URL, the CA fingerprint and a one-time join
 command. The console password is generated on first start and shown **once**; keep it,
@@ -122,15 +129,14 @@ or pin your own with `-admin-password`.
 
 ## How a task runs
 
-    browser ──HTTPS──▶ master ──start/stop──▶ agent(s) ──HTTP(S)──▶ target
-                        ▲                        │
-                        └──── progress/results ──┘
+    browser ──http(s)──▶ master ◀──encrypted WebSocket──▶ agent(s) ──http(s)──▶ target
 
 - The master splits the requested total concurrency across the selected nodes
-  (`ceil(total / nodes)`, clamped to 1..256 per node) and sends every node the *same*
+  (`ceil(total / nodes)`, clamped to 1..256 per node) and pushes every node the *same*
   task spec plus its own shard size.
-- Agents poll for commands over a long poll (20 s window) and push a progress sample
-  every second: cumulative requests, failures, bytes and the last error.
+- Commands, heartbeats, progress and results all travel over that one WebSocket: the
+  master pushes `start` / `stop`, the agent pushes a sample every second (cumulative
+  requests, failures, bytes, last error).
 - The master derives rates from successive counters rather than from agent clocks, so
   clock skew between machines cannot invent a throughput number. Totals are the sum of
   the shards; peak RPS is never reported below the average.
@@ -142,21 +148,41 @@ or pin your own with `-admin-password`.
 
 | Concern | Control |
 | --- | --- |
-| Transport | TLS 1.3 only, on every connection. Agents refuse to talk to anything that is not their pinned master. |
-| Cluster identity | The master generates its own ECDSA P-256 CA on first start. Nothing is trusted from the system root store. |
-| Agent identity | Each agent gets its own client certificate (90 days) signed by that CA; the master maps the certificate CN to a node record. |
-| Joining | One-time join token: HMAC-SHA256 signed, expiring (default 30 min), single use (nonce recorded). Guessing or reusing it does not work. |
-| First contact | The join credential carries the CA's SHA-256 fingerprint. The agent checks that the chain root matches that fingerprint *and* that the leaf was signed by it, so a man in the middle cannot enrol a fake master or read task traffic. |
-| Revocation | Revoking a node makes the master reject its certificate immediately, even though the certificate is still cryptographically valid. Certificates are also serial-checked, so a superseded certificate stops working as soon as it is renewed. |
+| Channel encryption | Every agent session runs an application-layer handshake inside the WebSocket: X25519 ephemeral keys, HKDF-SHA256 and AES-256-GCM with a strictly increasing frame counter. It is end-to-end with respect to the master process, so a TLS-terminating proxy in front of the console cannot weaken it, and plain `http` mode still gets an encrypted agent channel. Replaying or reordering a frame breaks the counter and drops the session. |
+| Master identity | The master generates its own ECDSA P-256 CA on first start and signs the handshake transcript with it. The agent only needs that CA's SHA-256 fingerprint (carried in the join credential) to know it is talking to the right master. Nothing is trusted from the system root store. |
+| Agent identity | Each agent holds its own client certificate (90 days) signed by that CA and signs the same transcript with its private key. The master maps the certificate CN to a node record and re-checks the certificate serial on every handshake. |
+| Joining | One-time token: HMAC-SHA256 signed, expiring (default 30 min), single use (nonce recorded). The CSR and the issued certificate travel inside the encrypted channel, so even `http` mode does not expose them. |
+| First contact | The agent compares the CA certificate presented during the handshake against the pinned fingerprint *before* deriving keys. A man in the middle cannot impersonate the master, and replaying an old handshake fails because both sides contribute a fresh nonce. |
+| Revocation | Revoking a node closes its live connection immediately and makes the next handshake fail. Certificates are serial-checked, so a superseded certificate stops working the moment it is renewed. |
+| TLS (optional outer layer) | With `https`, the console and the API are additionally wrapped in TLS 1.3 using the master's own certificate. The agent accepts either that certificate or a public one from a proxy, and never relies on TLS for identity. |
 | Console auth | bcrypt password hash (`admin.hash`), HttpOnly + Secure + SameSite=Strict session cookie, a CSRF header on every state-changing call, and per-IP login throttling with exponential lockout after 5 failures. |
+| SSH install | Host keys are trust-on-first-use and recorded in `<data>/ssh_known_hosts`; a changed key is refused. SSH credentials are used once and never written to disk. Only the master's own executable is uploaded — nothing is downloaded and executed on the target. |
 | Secrets at rest | `ca.key`, `admin.hash`, `secret.key` and agent keys are written 0600 inside the data directory. The console password is never stored in plaintext. |
-| Audit | `audit.log` (JSONL) records enrolment, rejected enrolments, token issuance, revocations, logins, and every task start/stop/result. |
+| Audit | `audit.log` (JSONL) records enrolment, rejected enrolments, token issuance, revocations, logins, SSH installs and every task start/stop/result. |
 | Blast radius | Agents listen on no port at all, so a compromised load generator cannot be used as a back door into the fleet. A task is limited to 64 nodes, 256 connections per node and 24 hours. |
 
-The console certificate is self-signed by that CA, so a browser will warn once. Either
-accept the warning or import `<data>/ca.crt` into the browser's trust store — the
-fingerprint printed at startup is what you compare against. When you reach the console
-through an address the master could not predict, add it with `-master-san 10.1.2.3`.
+Two things to know before deploying:
+
+- **Plain `http` protects the agent channel but not the browser.** The login password and
+  the session cookie are only as safe as the network path. Use `http` behind a TLS proxy
+  or on a trusted network; the master prints a warning at startup when you do.
+- **The console certificate is self-signed under `https`**, so a browser warns once.
+  Accept it or import `<data>/ca.crt` — the fingerprint printed at startup is what you
+  compare against. When you reach the console through an address the master could not
+  predict, add it with `-master-san 10.1.2.3`.
+
+## Installing agents over SSH
+
+The console's **SSH 安装** dialog logs into each host, uploads the master's own binary to
+`~/.webBenchmark-agent`, starts it in the background with a fresh one-time token, and
+waits until it connects back.
+
+- Needs a POSIX shell (`uname` must work) and either a password or a private key.
+- The first connection shows the host key fingerprint and installs nothing until you
+  confirm it; afterwards a changed host key is refused.
+- The binary must match the target platform; this is checked with `uname -sm` before the
+  upload. For a mixed fleet, point `-agent-binary` at the matching build.
+- Logs land in `~/.webBenchmark-agent/agent.log` on the target.
 
 ## Operations
 
@@ -166,6 +192,7 @@ through an address the master could not predict, add it with `-master-san 10.1.2
 | `<data>/secret.key` | HMAC key for join tokens and sessions. Rotating it invalidates pending tokens and logins. |
 | `<data>/state.json` | Node registry and already used join-token nonces. |
 | `<data>/tasks/<id>.json` | Final result of every task, kept for the console history. |
+| `<data>/ssh_known_hosts` | Trusted SSH host keys (trust on first use). |
 | `<data>/audit.log` | Append-only audit trail. |
 
 - Data directories default to `./webBenchmark-master` and `./webBenchmark-agent`; use
@@ -182,7 +209,7 @@ through an address the master could not predict, add it with `-master-san 10.1.2
 ## Distributed mode options
 
     -master string
-          run as the master node (web console and agent control plane), e.g. -master 0.0.0.0:8443
+          run as the master node (web console and agent control plane), e.g. -master 0.0.0.0:8443 or -master http://0.0.0.0:8080
     -agent
           run as an agent node and take tasks from the master
     -join string
@@ -195,6 +222,8 @@ through an address the master could not predict, add it with `-master-san 10.1.2
           master CA sha256 fingerprint, alternative to -join
     -ca-cert string
           path to the master ca.crt, used instead of -ca-fingerprint
+    -agent-binary string
+          path to the agent binary used by the ssh installer; defaults to the running executable
     -data string
           state directory; defaults to ./webBenchmark-master or ./webBenchmark-agent
     -node-name string
@@ -210,22 +239,21 @@ through an address the master could not predict, add it with `-master-san 10.1.2
 
 The console is a thin client over the same API, so everything can be scripted. Admin
 calls need the session cookie from `POST /api/v1/login` plus the `X-WB-CSRF` header
-returned by it; agent calls need the client certificate.
+returned by it; the agent channel authenticates inside the encrypted WebSocket handshake.
 
-    POST /api/v1/enroll              join token + CSR  -> node id + client certificate
-    POST /api/v1/agent/poll          long poll for start/stop commands (also the heartbeat)
-    POST /api/v1/agent/progress      one sample per second; the reply says whether to stop
-    POST /api/v1/agent/result        final counters
-    POST /api/v1/agent/renew         rotate the client certificate
-    POST /api/v1/login               console password -> session cookie + CSRF token
-    GET  /api/v1/session             installation info, auth state, csrf token
-    GET  /api/v1/nodes               node list with online state and live rates
-    POST /api/v1/nodes/{id}/revoke   block a node permanently
-    GET  /api/v1/tasks               recent tasks (running first, then history)
-    POST /api/v1/tasks               create and dispatch a task
-    GET  /api/v1/tasks/{id}          live snapshot: totals, per-node rows, series
-    POST /api/v1/tasks/{id}/stop     stop a running task
-    POST /api/v1/join                issue a fresh join command for a given master url
+    WS   /api/v1/agent/ws           encrypted control channel: hello/challenge/auth,
+                                    then start, stop, progress, result, heartbeat, renew
+    POST /api/v1/login              console password -> session cookie + CSRF token
+    GET  /api/v1/session            installation info, auth state, csrf token
+    GET  /api/v1/nodes              node list with online state and live rates
+    POST /api/v1/nodes/{id}/revoke  block a node permanently and drop its connection
+    GET  /api/v1/tasks              recent tasks (running first, then history)
+    POST /api/v1/tasks              create and dispatch a task
+    GET  /api/v1/tasks/{id}         live snapshot: totals, per-node rows, series
+    POST /api/v1/tasks/{id}/stop    stop a running task
+    POST /api/v1/join               issue a fresh join command for a given master url
+    POST /api/v1/ssh/probe          connect over ssh and return the host key fingerprint
+    POST /api/v1/ssh/install        upload the agent binary, start it, wait until it connects
 
 ## Behaviour notes
 

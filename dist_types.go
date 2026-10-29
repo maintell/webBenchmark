@@ -28,11 +28,6 @@ const (
 	distMaxNodeNameLen     = 32
 	distMinDurationSec     = 1
 	distMaxDurationSec     = 24 * 60 * 60
-
-	// 从节点向主控拉命令的长轮询等待时间。离线判定必须比它长，
-	// 否则每次正常的轮询间隙都会被误判成掉线。
-	distPollWait     = 20 * time.Second
-	distOfflineAfter = 30 * time.Second
 )
 
 // 任务状态。主控用它决定控制台怎么显示、是否还要继续等结果。
@@ -54,12 +49,6 @@ const (
 	shardStopped  = "stopped"
 	shardLost     = "lost"
 	shardErrored  = "error"
-)
-
-// 命令类型。主控通过长轮询把它们下发给从节点。
-const (
-	cmdStart = "start"
-	cmdStop  = "stop"
 )
 
 // HeaderPair 是一条自定义请求头的线格式。
@@ -92,13 +81,6 @@ type TaskSpec struct {
 	CreatedAt   time.Time    `json:"createdAt"`
 }
 
-// Command 是主控下发给某个节点的一条指令。
-type Command struct {
-	Kind   string    `json:"kind"`
-	TaskID string    `json:"taskId"`
-	Spec   *TaskSpec `json:"spec,omitempty"`
-}
-
 // Progress 是从节点每秒上报一次的运行数据。
 // 计数是"本任务开始以来的累计值"，主控据此算差分速率，
 // 这样即使主从时钟有偏差，也不会算出一个荒谬的瞬时速率。
@@ -124,48 +106,8 @@ type TaskResult struct {
 	Error     string `json:"error,omitempty"`
 }
 
-// pollRequest 同时承担心跳：每次拉命令都顺带报告自己是谁、在跑什么。
-type pollRequest struct {
-	Proto   int    `json:"proto"`
-	Version string `json:"version"`
-	OS      string `json:"os"`
-	Arch    string `json:"arch"`
-	CPUs    int    `json:"cpus"`
-	Running string `json:"running,omitempty"`
-}
-
-type pollResponse struct {
-	Command    *Command  `json:"command,omitempty"`
-	ServerTime time.Time `json:"serverTime"`
-}
-
-type enrollRequest struct {
-	Token   string `json:"token"`
-	CSR     string `json:"csr"`
-	Name    string `json:"name"`
-	Version string `json:"version"`
-	OS      string `json:"os"`
-	Arch    string `json:"arch"`
-	CPUs    int    `json:"cpus"`
-}
-
-type enrollResponse struct {
-	NodeID     string    `json:"nodeId"`
-	CertPEM    string    `json:"certPem"`
-	CAPEM      string    `json:"caPem"`
-	ServerTime time.Time `json:"serverTime"`
-}
-
-type renewRequest struct {
-	CSR string `json:"csr"`
-}
-
-type renewResponse struct {
-	NodeID     string    `json:"nodeId"`
-	CertPEM    string    `json:"certPem"`
-	ExpiresAt  time.Time `json:"expiresAt"`
-	ServerTime time.Time `json:"serverTime"`
-}
+// pollRequest 与 enroll/renew 那批结构已经随 WebSocket 通道一起删除：
+// 现在入网、心跳、进度、结果、换证都走同一条加密连接（见 dist_secure.go）。
 
 // taskCreateRequest 是控制台/API 建任务时提交的内容。
 // 它内嵌 TaskSpec，因此客户端可以把任务参数平铺在同一个 JSON 里。

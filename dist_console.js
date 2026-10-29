@@ -599,6 +599,83 @@ $("copy-join").addEventListener("click", async () => {
   setTimeout(() => { $("copy-join").textContent = "复制命令"; }, 2000);
 });
 
+// ---------- SSH 批量安装 ----------
+
+$("ssh-btn").addEventListener("click", () => {
+  const dialog = $("ssh-dialog");
+  if (!$("ssh-master-url").value) $("ssh-master-url").value = location.origin;
+  if (!dialog.open) dialog.showModal();
+});
+
+function sshLog(line) {
+  const box = $("ssh-log");
+  box.textContent = box.textContent ? box.textContent + "\n" + line : line;
+  box.scrollTop = box.scrollHeight;
+}
+
+function parseHostLine(line, defaultPort) {
+  const trimmed = line.trim();
+  if (!trimmed) return null;
+  const parts = trimmed.split(":");
+  const host = parts[0].trim();
+  const port = Number(parts[1]) || defaultPort;
+  return host ? { host, port } : null;
+}
+
+// 逐台安装：每台都是一次独立的请求，任何一台失败都不影响其它机器，
+// 结果按行回显，运维可以直接看出卡在哪一步。
+$("ssh-run").addEventListener("click", async () => {
+  const defaultPort = Number($("ssh-port").value) || 22;
+  const targets = $("ssh-hosts").value
+    .split(/\r?\n/)
+    .map((line) => parseHostLine(line, defaultPort))
+    .filter(Boolean);
+  if (targets.length === 0) {
+    sshLog("先填至少一台主机");
+    return;
+  }
+  const user = $("ssh-user").value.trim() || "root";
+  const password = $("ssh-password").value;
+  const keyPath = $("ssh-key").value.trim();
+  const masterUrl = $("ssh-master-url").value.trim();
+  if (!password && !keyPath) {
+    sshLog("需要 SSH 密码或私钥路径之一");
+    return;
+  }
+
+  const btn = $("ssh-run");
+  btn.disabled = true;
+  $("ssh-log").textContent = "";
+  let ok = 0;
+  for (const target of targets) {
+    const nodeName = target.host.replace(/[^A-Za-z0-9._-]/g, "-");
+    const body = { host: target.host, port: target.port, user, password, keyPath, masterUrl, nodeName };
+    sshLog(`== ${target.host}:${target.port} 安装中…`);
+    try {
+      let out = await api("/api/v1/ssh/install", { method: "POST", body });
+      if (out.needsTrust) {
+        const accept = confirm(`首次连接 ${target.host}，主机指纹：\n${out.fingerprint}\n\n确认信任并继续？`);
+        if (!accept) {
+          sshLog("   已跳过（未信任主机指纹）");
+          continue;
+        }
+        out = await api("/api/v1/ssh/install", { method: "POST", body: { ...body, acceptFingerprint: out.fingerprint } });
+      }
+      if (out.ok) {
+        ok++;
+        sshLog(`   ✓ ${out.message} ${out.nodeId || ""}`);
+      } else {
+        sshLog(`   ✗ ${out.message}`);
+      }
+    } catch (err) {
+      sshLog(`   ✗ ${err.message}`);
+    }
+  }
+  sshLog(`完成：${ok}/${targets.length} 台已连接`);
+  btn.disabled = false;
+  refreshNodes().catch(() => {});
+});
+
 // ---------- 格式化与工具 ----------
 
 const intFmt = new Intl.NumberFormat("en-US");

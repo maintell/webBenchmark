@@ -21,7 +21,7 @@ import (
 	"github.com/apoorvam/goterminal"
 )
 
-const version = "0.11"
+const version = "0.12"
 
 type benchOptions struct {
 	postContent string
@@ -77,6 +77,7 @@ var (
 	distAdminPassword = flag.String("admin-password", "", "master console password, at least 10 characters; a random one is generated when omitted")
 	masterSAN         = flag.String("master-san", "", "extra comma separated SANs for the master certificate (ip or dns name)")
 	joinTTLMin        = flag.Int("join-ttl", 30, "join token lifetime in minutes")
+	agentBinaryPath   = flag.String("agent-binary", "", "path to the agent binary used by the ssh installer; defaults to the running executable")
 )
 
 func setTargetURL(s string) {

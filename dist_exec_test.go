@@ -8,6 +8,15 @@ import (
 	"time"
 )
 
+// stopSignal 返回一个已经放好原因的停止通道。
+func stopSignal(reason string) <-chan string {
+	ch := make(chan string, 1)
+	if reason != "" {
+		ch <- reason
+	}
+	return ch
+}
+
 // TestRunDistTaskReportsStoppedWhenCancelled 验证"被叫停"与"跑完"不会混为一谈。
 func TestRunDistTaskReportsStoppedWhenCancelled(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -25,7 +34,7 @@ func TestRunDistTaskReportsStoppedWhenCancelled(t *testing.T) {
 	}()
 	defer cancel()
 
-	res := runDistTask(ctx, spec, 1, nil)
+	res := runDistTask(ctx, spec, 1, nil, make(chan string))
 	if res.Status != taskStopped {
 		t.Fatalf("cancelled task should be stopped, got %s (%s)", res.Status, res.Error)
 	}
@@ -40,15 +49,12 @@ func TestRunDistTaskReportsErrorWhenNothingSent(t *testing.T) {
 	spec := &TaskSpec{ID: "task-bad", Target: "http://127.0.0.1:1/", DurationSec: 1, TimeoutSec: 1, PerNodeConc: 1}
 	spec.normalize()
 
-	res := runDistTask(context.Background(), spec, 1, nil)
+	res := runDistTask(context.Background(), spec, 1, nil, make(chan string))
 	if res.Status != taskErrored {
 		t.Fatalf("a task that sent nothing should be error, got %s", res.Status)
 	}
-	if res.Error == "" {
-		t.Fatal("the error status should carry a reason")
-	}
-	if res.Requests != 0 {
-		t.Fatalf("expected zero successful requests, got %d", res.Requests)
+	if res.Error == "" || res.Requests != 0 {
+		t.Fatalf("unexpected result: %+v", res)
 	}
 }
 
@@ -63,7 +69,7 @@ func TestRunDistTaskHonoursDeadline(t *testing.T) {
 	spec.normalize()
 
 	start := time.Now()
-	res := runDistTask(context.Background(), spec, 2, nil)
+	res := runDistTask(context.Background(), spec, 2, nil, make(chan string))
 	if res.Status != taskDone {
 		t.Fatalf("a task that reached its deadline should be done, got %s (%s)", res.Status, res.Error)
 	}
@@ -76,8 +82,9 @@ func TestRunDistTaskHonoursDeadline(t *testing.T) {
 	}
 }
 
-// TestRunDistTaskStopsWhenSampleSaysSo 验证主控可以在某一帧上喊停。
-func TestRunDistTaskStopsWhenSampleSaysSo(t *testing.T) {
+// TestRunDistTaskStopsWhenToldTo 验证主控下发的 stop 能让任务停下，
+// 并且 reason=deadline 时要算正常完成而不是中断。
+func TestRunDistTaskStopsWhenToldTo(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte("ok"))
 	}))
@@ -86,18 +93,20 @@ func TestRunDistTaskStopsWhenSampleSaysSo(t *testing.T) {
 	spec := &TaskSpec{ID: "task-cb", Target: srv.URL, DurationSec: 30, TimeoutSec: 5, PerNodeConc: 1}
 	spec.normalize()
 
-	samples := 0
-	res := runDistTask(context.Background(), spec, 1, func(p Progress) (bool, bool) {
-		samples++
-		if samples >= 2 {
-			return true, false // 主控/控制台要求停
-		}
-		return false, false
-	})
+	res := runDistTask(context.Background(), spec, 1, nil, stopSignal("stopped"))
 	if res.Status != taskStopped {
-		t.Fatalf("a callback stop should end as stopped, got %s", res.Status)
+		t.Fatalf("an operator stop should end as stopped, got %s", res.Status)
 	}
-	if samples < 2 {
-		t.Fatalf("expected at least two samples, got %d", samples)
+
+	// deadline 停止要算正常完成：给任务一点时间真的发出请求，
+	// 否则"零请求"会优先判成 error（那是另一条正确的分支）。
+	late := make(chan string, 1)
+	go func() {
+		time.Sleep(400 * time.Millisecond)
+		late <- "deadline"
+	}()
+	res = runDistTask(context.Background(), spec, 1, nil, late)
+	if res.Status != taskDone {
+		t.Fatalf("a deadline stop should still count as done, got %s (%s)", res.Status, res.Error)
 	}
 }

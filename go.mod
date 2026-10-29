@@ -5,6 +5,7 @@ go 1.21
 require (
 	github.com/EDDYCJY/fake-useragent v0.2.0
 	github.com/apoorvam/goterminal v0.0.0-20180523175556-614d345c47e5
+	github.com/gorilla/websocket v1.5.3
 	github.com/miekg/dns v1.1.43
 	github.com/quic-go/quic-go v0.42.0
 	github.com/shirou/gopsutil v3.21.4+incompatible

@@ -1,5 +1,66 @@
 # Changelog
 
+## 0.12
+
+### Changed — the agent channel is now one encrypted WebSocket
+
+- **Long polling is gone.** Enrolment, heartbeats, `start`/`stop`, progress, results and
+  certificate renewal all travel over `WS /api/v1/agent/ws`. The master pushes commands
+  instead of waiting for the next poll, and "online" now means exactly "has a live
+  connection" rather than "was seen in the last 30 seconds".
+- **Encryption and identity moved into the channel itself.** Each session performs an
+  application-layer handshake: X25519 ephemeral keys, HKDF-SHA256, AES-256-GCM frames
+  with a strictly increasing counter. The master proves itself by signing the transcript
+  with its CA key; the agent proves itself by signing the same transcript with the key of
+  its CA-issued certificate. Nonces on both sides make a replayed handshake useless, and a
+  frame that is reordered, replayed or tampered with kills the session.
+- **Why not just mTLS:** the master is routinely put behind nginx/caddy, where TLS ends
+  and client certificates may never reach the process. Doing the handshake in the
+  application keeps the same guarantee in that deployment, and it is the only way plain
+  `http` can still promise an encrypted control channel.
+
+### Added — http or https, your choice
+
+- `-master https://0.0.0.0:8443` (default) or `-master http://0.0.0.0:8080`. The scheme
+  also flows into the join credential, so agents dial `wss://` or `ws://` accordingly.
+- With `http` the master prints a startup warning: the agent channel is still encrypted
+  end to end, but the browser session (login password, cookie) relies on the network or a
+  fronting TLS proxy. The console is unchanged — it just talks to whatever origin serves it.
+- Under `https` the agent accepts either the master's own CA certificate or, when a proxy
+  terminates TLS, a certificate from the system trust store. Identity never depends on
+  which of the two was used.
+
+### Added — install agents over SSH
+
+- The console gained **SSH 安装**: give hosts, user, password or key, and the master logs
+  in, checks `uname -sm` against the binary it is about to upload, copies its own
+  executable to `~/.webBenchmark-agent`, starts it with a fresh one-time token and waits
+  until the node connects back.
+- Host keys are trust-on-first-use: the first attempt returns the fingerprint and installs
+  nothing until the operator confirms it; it is then recorded in `<data>/ssh_known_hosts`
+  and a later mismatch is refused.
+- SSH credentials live only in the request; nothing about them is written to disk. Only
+  the master's own binary (or `-agent-binary`) is uploaded — the installer never fetches
+  and executes something from the network.
+- Target directory, node name and user are validated against a strict character set
+  because they are interpolated into a remote shell command.
+
+### Fixed while rewriting the transport
+
+- **A restarted agent could not reconnect.** The CA fingerprint and the server URL were
+  only read from the command-line config, so an agent starting from its saved identity
+  compared against an empty fingerprint and aborted the handshake. Both now fall back to
+  the persisted state.
+- **Revoking a node left its session alive** until the next poll timeout; the connection
+  is now closed as part of the revocation, and the following handshake is refused with
+  "节点已被吊销".
+- **A finished task could be reported as stopped** when the master's deadline fired at
+  the same moment; the stop frame now carries `deadline` or `stopped`, and only the latter
+  marks a task interrupted.
+- **Test-suite data race** in the end-to-end test: it read `agent.state` while the agent
+  goroutine was still writing it during enrolment; node IDs are now taken from the
+  master's registry.
+
 ## 0.11
 
 ### Added — distributed load testing

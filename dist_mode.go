@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -54,8 +55,8 @@ func decodeJoinString(s string) (joinInfo, error) {
 	if info.V != distProtoVersion {
 		return info, fmt.Errorf("加入凭据版本 %d 与当前版本 %d 不一致，请让主从使用同一版本", info.V, distProtoVersion)
 	}
-	if !strings.HasPrefix(info.URL, "https://") {
-		return info, errors.New("加入凭据里的主控地址不是 https")
+	if !strings.HasPrefix(info.URL, "https://") && !strings.HasPrefix(info.URL, "http://") {
+		return info, errors.New("加入凭据里的主控地址不是 http / https")
 	}
 	if len(normalizeFingerprint(info.Fingerprint)) != 64 {
 		return info, errors.New("加入凭据里的 CA 指纹不合法")
@@ -89,6 +90,31 @@ func validateDistFlags() error {
 	return nil
 }
 
+// parseListenSpec 解析 -master 的取值：可带 http:// 或 https:// 前缀，默认 https。
+//
+// 为什么允许纯 http：很多部署把主控挂在内网，或者前面已经有 TLS 终止代理。
+// 主从通道自身在应用层加密（见 dist_secure.go），所以 http 只影响浏览器那一侧，
+// 而这个影响会在启动横幅里明确警告。
+func parseListenSpec(spec string) (scheme, addr string, err error) {
+	spec = strings.TrimSpace(spec)
+	if spec == "" {
+		return "", "", errors.New("缺少监听地址")
+	}
+	scheme = "https"
+	if i := strings.Index(spec, "://"); i >= 0 {
+		scheme = strings.ToLower(spec[:i])
+		spec = spec[i+3:]
+	}
+	if scheme != "http" && scheme != "https" {
+		return "", "", fmt.Errorf("监听方案只支持 http 或 https，收到 %q", scheme)
+	}
+	spec = strings.TrimSuffix(spec, "/")
+	if _, _, err := net.SplitHostPort(spec); err != nil {
+		return "", "", fmt.Errorf("监听地址必须是 host:port，收到 %q", spec)
+	}
+	return scheme, spec, nil
+}
+
 // masterHosts 收集服务端证书要覆盖的名字。
 // 监听 0.0.0.0 时无法知道运维会从哪个地址访问，用主机名兜底，
 // 其余由 -master-san 补充。
@@ -111,6 +137,10 @@ func masterHosts(bind string) []string {
 }
 
 func runMasterMode() error {
+	scheme, addr, err := parseListenSpec(*masterListen)
+	if err != nil {
+		return err
+	}
 	dir := strings.TrimSpace(*distData)
 	if dir == "" {
 		dir = "webBenchmark-master"
@@ -121,7 +151,7 @@ func runMasterMode() error {
 	}
 	m, err := newMaster(masterOptions{
 		Dir:       dir,
-		Hosts:     masterHosts(*masterListen),
+		Hosts:     masterHosts(addr),
 		JoinTTL:   time.Duration(*joinTTLMin) * time.Minute,
 		AdminHash: hash,
 	})
@@ -131,12 +161,12 @@ func runMasterMode() error {
 	defer m.close()
 
 	// 先绑定端口再打印横幅：端口被占时不应该先给出一串看起来可用的地址。
-	ln, err := net.Listen("tcp", *masterListen)
+	ln, err := net.Listen("tcp", addr)
 	if err != nil {
-		return fmt.Errorf("监听 %s 失败: %w", *masterListen, err)
+		return fmt.Errorf("监听 %s 失败: %w", addr, err)
 	}
 
-	publicURL := masterPublicURL(*masterListen)
+	publicURL := masterPublicURL(scheme, addr)
 	info, err := m.newJoin(publicURL)
 	if err != nil {
 		return err
@@ -144,11 +174,16 @@ func runMasterMode() error {
 
 	fmt.Fprintf(os.Stderr, `webBenchmark %s 主控
   控制台     %s/
+  数据传输   应用层加密（X25519 + AES-256-GCM），主从共用一条 WebSocket
   CA 指纹    sha256:%s
   加入命令   webBenchmark -join %s
 
-  从节点只需对外发起连接，不需要开放任何入站端口。
+  从节点只主动外连，不需要开放任何入站端口。
 `, version, publicURL, m.pki.displayFingerprint(), info.encode())
+	if scheme == "http" {
+		fmt.Fprintf(os.Stderr, "\n  注意：当前是纯 http。主从通道仍然端到端加密，但浏览器登录这一段\n"+
+			"        没有传输保护（密码可能被嗅探），请只在内网或前置 TLS 代理后面这样部署。\n")
+	}
 	if generated != "" {
 		fmt.Fprintf(os.Stderr, "  控制台密码 %s\n"+
 			"             （首次启动自动生成，只显示这一次；忘记后用 -admin-password 重置）\n", generated)
@@ -156,7 +191,12 @@ func runMasterMode() error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	return m.serve(ctx, ln)
+
+	var tlsConf *tls.Config
+	if scheme == "https" {
+		tlsConf = m.tlsConfig
+	}
+	return m.serve(ctx, ln, tlsConf)
 }
 
 func runAgentMode() error {

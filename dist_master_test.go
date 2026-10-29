@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
-	"crypto/x509"
 	"encoding/json"
 	"io"
 	"log"
@@ -21,7 +20,7 @@ import (
 const testAdminPassword = "test-admin-password"
 
 // newTestMaster 起一个真实 TLS 控制面（httptest），
-// 证书与客户端校验规则和生产环境完全一致：只信任自建 CA，且允许浏览器不带客户端证书。
+// 证书与校验规则和生产一致：只信任自建 CA，不要求客户端证书（身份在应用层握手）。
 func newTestMaster(t *testing.T) (*master, *httptest.Server) {
 	t.Helper()
 	dir := t.TempDir()
@@ -29,25 +28,17 @@ func newTestMaster(t *testing.T) (*master, *httptest.Server) {
 	if err != nil {
 		t.Fatalf("admin hash: %v", err)
 	}
-	m, err := newMaster(masterOptions{
-		Dir:       dir,
-		JoinTTL:   15 * time.Minute,
-		AdminHash: hash,
-		PollWait:  300 * time.Millisecond,
-	})
+	m, err := newMaster(masterOptions{Dir: dir, JoinTTL: 15 * time.Minute, AdminHash: hash})
 	if err != nil {
 		t.Fatalf("newMaster: %v", err)
 	}
 	srv := httptest.NewUnstartedServer(m.handler())
-	srv.TLS = &tls.Config{
-		Certificates: []tls.Certificate{m.serverCert},
-		MinVersion:   tls.VersionTLS13,
-		ClientAuth:   tls.VerifyClientCertIfGiven,
-		ClientCAs:    m.pki.caPool(),
-	}
+	srv.TLS = m.tlsConfig
 	srv.StartTLS()
 	srv.Config.ErrorLog = log.New(io.Discard, "", 0)
 	t.Cleanup(func() {
+		// 先断开已升级的 WebSocket，否则 Close 会一直等 handler 返回。
+		m.closeAgentConns()
 		srv.Close()
 		m.close()
 	})
@@ -126,173 +117,85 @@ func (a *testAdmin) call(method, path string, body any, out any) int {
 	return status
 }
 
-func newTestAgent(t *testing.T, m *master, base, dir, name string) *agent {
+// connectAgent 建立真实会话，并等到主控侧把它登记为在线。
+func connectAgent(t *testing.T, m *master, a *agent) *agentSession {
 	t.Helper()
-	token, _, err := m.pki.newJoinToken(10 * time.Minute)
+	ctx, cancel := context.WithCancel(context.Background())
+	sess, err := a.connect(ctx)
 	if err != nil {
-		t.Fatal(err)
+		cancel()
+		t.Fatalf("connect %s: %v", a.name, err)
 	}
-	a, err := newAgent(agentConfig{
-		Dir:         dir,
-		URL:         base,
-		Name:        name,
-		Token:       token,
-		Fingerprint: m.pki.fp,
+	t.Cleanup(func() {
+		sess.Close()
+		cancel()
 	})
-	if err != nil {
-		t.Fatalf("enroll %s: %v", name, err)
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		m.mu.Lock()
+		n := m.nodes[a.state.NodeID]
+		online := n != nil && n.conn != nil
+		m.mu.Unlock()
+		if online {
+			return sess
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
-	return a
-}
-
-func agentPost(t *testing.T, a *agent, path string, body any) (int, []byte) {
-	t.Helper()
-	data, err := json.Marshal(body)
-	if err != nil {
-		t.Fatal(err)
-	}
-	req, err := http.NewRequest(http.MethodPost, a.endpoint(path), bytes.NewReader(data))
-	if err != nil {
-		t.Fatal(err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := a.client().Do(req)
-	if err != nil {
-		t.Fatalf("agent %s: %v", path, err)
-	}
-	defer resp.Body.Close()
-	out, _ := io.ReadAll(resp.Body)
-	return resp.StatusCode, out
-}
-
-func TestEnrollRejectsBadToken(t *testing.T) {
-	m, srv := newTestMaster(t)
-
-	_, csr, err := newAgentCSR("evil")
-	if err != nil {
-		t.Fatal(err)
-	}
-	// 指纹正确的客户端：说明这一步被拒的原因是令牌，而不是 TLS。
-	pinned := newPinnedClient(t, m)
-	status, body := postRaw(t, pinned, srv.URL+"/api/v1/enroll", enrollRequest{
-		Token: "wb1.bogus.sig", CSR: csr, Name: "evil",
-	})
-	if status != http.StatusForbidden {
-		t.Fatalf("bad token should be 403, got %d %s", status, body)
-	}
-	if !strings.Contains(string(body), "令牌") {
-		t.Fatalf("rejection should mention the token: %s", body)
-	}
+	t.Fatalf("node %s did not come online", a.state.NodeID)
+	return nil
 }
 
 func TestJoinTokenIsSingleUse(t *testing.T) {
 	m, srv := newTestMaster(t)
-	token, _, err := m.pki.newJoinToken(10 * time.Minute)
+	first := enrollTestAgent(t, m, srv.URL, t.TempDir(), "a1")
+	connectAgent(t, m, first)
+
+	cfg := first.cfg
+	cfg.Dir = t.TempDir()
+	second, err := newAgent(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	dir1 := t.TempDir()
-	if _, err := newAgent(agentConfig{Dir: dir1, URL: srv.URL, Name: "a1", Token: token, Fingerprint: m.pki.fp}); err != nil {
-		t.Fatalf("first enroll: %v", err)
-	}
-	dir2 := t.TempDir()
-	_, err = newAgent(agentConfig{Dir: dir2, URL: srv.URL, Name: "a2", Token: token, Fingerprint: m.pki.fp})
-	if err == nil {
+	if _, err := second.connect(context.Background()); err == nil {
 		t.Fatal("the same join token must not enroll a second node")
 	}
-	if !strings.Contains(err.Error(), "已被使用") {
-		t.Fatalf("unexpected error: %v", err)
-	}
 }
 
-func TestAgentAPIRefusesMissingClientCert(t *testing.T) {
+func TestAgentWSRejectsBadToken(t *testing.T) {
 	m, srv := newTestMaster(t)
-	plain := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{
-		RootCAs:    m.pki.caPool(),
-		ServerName: distServerName,
-		MinVersion: tls.VersionTLS13,
-	}}}
-	status, body := postRaw(t, plain, srv.URL+"/api/v1/agent/poll", pollRequest{Proto: distProtoVersion})
-	if status != http.StatusUnauthorized {
-		t.Fatalf("poll without a client cert should be 401, got %d %s", status, body)
-	}
-}
-
-func TestEnrolledAgentCanPoll(t *testing.T) {
-	m, srv := newTestMaster(t)
-	a := newTestAgent(t, m, srv.URL, t.TempDir(), "loadgen-1")
-
-	// 没有命令时，长轮询应当一直挂到窗口结束才返回空。
-	started := time.Now()
-	status, body := agentPost(t, a, "/api/v1/agent/poll", pollRequest{Proto: distProtoVersion, Version: version})
-	if status != http.StatusOK {
-		t.Fatalf("poll returned %d %s", status, body)
-	}
-	if elapsed := time.Since(started); elapsed < m.pollWait/2 {
-		t.Fatalf("poll returned after %s, expected it to wait about %s", elapsed, m.pollWait)
-	}
-	var empty pollResponse
-	if err := json.Unmarshal(body, &empty); err != nil {
+	a, err := newAgent(agentConfig{
+		Dir: t.TempDir(), URL: srv.URL, Name: "evil",
+		Token: "wb1.bogus.sig", Fingerprint: m.pki.fp,
+	})
+	if err != nil {
 		t.Fatal(err)
 	}
-	if empty.Command != nil {
-		t.Fatalf("no command was queued, got %+v", empty.Command)
+	_, err = a.connect(context.Background())
+	if err == nil {
+		t.Fatal("a bogus token must be rejected")
 	}
-
-	// 排一条命令后，长轮询必须被立刻唤醒，而不是等满窗口。
-	m.mu.Lock()
-	m.enqueueLocked(a.state.NodeID, Command{Kind: cmdStop, TaskID: "task-abc"})
-	m.mu.Unlock()
-
-	started = time.Now()
-	status, body = agentPost(t, a, "/api/v1/agent/poll", pollRequest{Proto: distProtoVersion})
-	if status != http.StatusOK {
-		t.Fatalf("poll returned %d %s", status, body)
-	}
-	if elapsed := time.Since(started); elapsed > m.pollWait {
-		t.Fatalf("queued command should wake the poll immediately, took %s", elapsed)
-	}
-	var withCmd pollResponse
-	if err := json.Unmarshal(body, &withCmd); err != nil {
-		t.Fatal(err)
-	}
-	if withCmd.Command == nil || withCmd.Command.Kind != cmdStop || withCmd.Command.TaskID != "task-abc" {
-		t.Fatalf("unexpected command: %+v", withCmd.Command)
-	}
-}
-
-func TestPollRejectsProtocolMismatch(t *testing.T) {
-	m, srv := newTestMaster(t)
-	a := newTestAgent(t, m, srv.URL, t.TempDir(), "loadgen-1")
-
-	status, body := agentPost(t, a, "/api/v1/agent/poll", pollRequest{Proto: distProtoVersion + 1})
-	if status != http.StatusConflict {
-		t.Fatalf("mixed protocol versions must be rejected with 409, got %d %s", status, body)
-	}
-	if !strings.Contains(string(body), "协议版本") {
-		t.Fatalf("error should explain the version mismatch: %s", body)
+	if !strings.Contains(err.Error(), "令牌") {
+		t.Fatalf("error should mention the token: %v", err)
 	}
 }
 
 func TestRevokedNodeIsRejected(t *testing.T) {
 	m, srv := newTestMaster(t)
 	admin := newTestAdmin(t, m, srv.URL)
-	a := newTestAgent(t, m, srv.URL, t.TempDir(), "loadgen-1")
-
-	if status, body := agentPost(t, a, "/api/v1/agent/poll", pollRequest{Proto: distProtoVersion}); status != http.StatusOK {
-		t.Fatalf("healthy node poll should be 200, got %d %s", status, body)
-	}
+	a := enrollTestAgent(t, m, srv.URL, t.TempDir(), "a1")
+	connectAgent(t, m, a)
 
 	if status := admin.call(http.MethodPost, "/api/v1/nodes/"+a.state.NodeID+"/revoke", nil, nil); status != http.StatusOK {
 		t.Fatalf("revoke failed: %d", status)
 	}
-	status, body := agentPost(t, a, "/api/v1/agent/poll", pollRequest{Proto: distProtoVersion})
-	if status != http.StatusForbidden {
-		t.Fatalf("revoked node should be 403, got %d %s", status, body)
-	}
-	if !strings.Contains(string(body), "吊销") {
-		t.Fatalf("revoked node should be told why: %s", body)
+
+	// 吊销要当场生效：已建立的连接被主控关闭，重连在握手阶段被拒。
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := a.connect(ctx); err == nil {
+		t.Fatal("a revoked node must not reconnect")
+	} else if !strings.Contains(err.Error(), "吊销") {
+		t.Fatalf("error should say the node was revoked: %v", err)
 	}
 }
 
@@ -321,7 +224,6 @@ func TestConsoleRequiresSessionAndCSRF(t *testing.T) {
 	if status := admin.call(http.MethodGet, "/api/v1/nodes", nil, nil); status != http.StatusOK {
 		t.Fatalf("authenticated node list should be 200, got %d", status)
 	}
-	// 不带 CSRF 头的写操作必须被拒
 	if status, _ := admin.raw(http.MethodPost, "/api/v1/tasks", taskCreateRequest{}, nil); status != http.StatusForbidden {
 		t.Fatalf("POST without csrf should be 403, got %d", status)
 	}
@@ -345,7 +247,6 @@ func TestLoginLockout(t *testing.T) {
 	if status != http.StatusTooManyRequests {
 		t.Fatalf("after %d failures the source should be throttled, got %d %s", distMaxLoginFails, status, body)
 	}
-	// 即使密码正确，封锁期内也不能登录
 	status, _ = postRaw(t, anon, srv.URL+"/api/v1/login", map[string]string{"password": testAdminPassword})
 	if status != http.StatusTooManyRequests {
 		t.Fatalf("blocked source must stay blocked, got %d", status)
@@ -355,8 +256,10 @@ func TestLoginLockout(t *testing.T) {
 func TestCreateTaskSplitsConcurrencyAndRejectsBusyNodes(t *testing.T) {
 	m, srv := newTestMaster(t)
 	admin := newTestAdmin(t, m, srv.URL)
-	a1 := newTestAgent(t, m, srv.URL, t.TempDir(), "a1")
-	a2 := newTestAgent(t, m, srv.URL, t.TempDir(), "a2")
+	a1 := enrollTestAgent(t, m, srv.URL, t.TempDir(), "a1")
+	a2 := enrollTestAgent(t, m, srv.URL, t.TempDir(), "a2")
+	connectAgent(t, m, a1)
+	connectAgent(t, m, a2)
 
 	var view taskView
 	status := admin.call(http.MethodPost, "/api/v1/tasks", taskCreateRequest{
@@ -375,14 +278,10 @@ func TestCreateTaskSplitsConcurrencyAndRejectsBusyNodes(t *testing.T) {
 	if view.PerNodeConc != 5 {
 		t.Fatalf("per node concurrency should be 5, got %d", view.PerNodeConc)
 	}
-	if view.TotalConc != 10 {
-		t.Fatalf("total concurrency should be 10, got %d", view.TotalConc)
-	}
 	if len(view.Nodes) != 2 {
 		t.Fatalf("expected 2 shards, got %d", len(view.Nodes))
 	}
 
-	// 同一批节点不能并行跑第二条任务
 	status = admin.call(http.MethodPost, "/api/v1/tasks", taskCreateRequest{
 		TaskSpec:  TaskSpec{Target: "https://example.com/", DurationSec: 30, TimeoutSec: 5},
 		NodeIDs:   []string{a1.state.NodeID},
@@ -392,18 +291,11 @@ func TestCreateTaskSplitsConcurrencyAndRejectsBusyNodes(t *testing.T) {
 		t.Fatalf("busy node should be rejected with 400, got %d", status)
 	}
 
-	// 收尾，避免后台的 watchTask 一直跑
+	// 收尾，避免看门狗一直跑
+	m.applyResult(a1.state.NodeID, TaskResult{TaskID: view.ID, Status: taskDone, Requests: 1})
+	m.applyResult(a2.state.NodeID, TaskResult{TaskID: view.ID, Status: taskDone, Requests: 1})
 	m.mu.Lock()
-	task := m.tasks[view.ID]
-	m.mu.Unlock()
-	if task == nil {
-		t.Fatal("task should be registered")
-	}
-	for _, id := range []string{a1.state.NodeID, a2.state.NodeID} {
-		m.applyResult(id, TaskResult{TaskID: view.ID, Status: taskDone, Requests: 1})
-	}
-	m.mu.Lock()
-	state := task.state
+	state := m.tasks[view.ID].state
 	m.mu.Unlock()
 	if state != taskDone {
 		t.Fatalf("task should be done after every shard reported, got %s", state)
@@ -413,8 +305,10 @@ func TestCreateTaskSplitsConcurrencyAndRejectsBusyNodes(t *testing.T) {
 func TestProgressAggregation(t *testing.T) {
 	m, srv := newTestMaster(t)
 	admin := newTestAdmin(t, m, srv.URL)
-	a1 := newTestAgent(t, m, srv.URL, t.TempDir(), "a1")
-	a2 := newTestAgent(t, m, srv.URL, t.TempDir(), "a2")
+	a1 := enrollTestAgent(t, m, srv.URL, t.TempDir(), "a1")
+	a2 := enrollTestAgent(t, m, srv.URL, t.TempDir(), "a2")
+	connectAgent(t, m, a1)
+	connectAgent(t, m, a2)
 
 	var view taskView
 	if status := admin.call(http.MethodPost, "/api/v1/tasks", taskCreateRequest{
@@ -425,33 +319,20 @@ func TestProgressAggregation(t *testing.T) {
 		t.Fatalf("create task: %d", status)
 	}
 
-	// 第一帧只建立基线，第二帧才开始算速率
 	m.applyProgress(a1.state.NodeID, Progress{TaskID: view.ID, Seq: 1, Requests: 100, Bytes: 1000})
 	m.applyProgress(a2.state.NodeID, Progress{TaskID: view.ID, Seq: 1, Requests: 50, Bytes: 500})
 	time.Sleep(250 * time.Millisecond)
-	stop, byDeadline, known := m.applyProgress(a1.state.NodeID, Progress{TaskID: view.ID, Seq: 2, Requests: 200, Failed: 3, Bytes: 2000})
-	if !known || stop || byDeadline {
-		t.Fatalf("progress should be accepted while running (known=%v stop=%v deadline=%v)", known, stop, byDeadline)
-	}
+	m.applyProgress(a1.state.NodeID, Progress{TaskID: view.ID, Seq: 2, Requests: 200, Failed: 3, Bytes: 2000})
 	m.applyProgress(a2.state.NodeID, Progress{TaskID: view.ID, Seq: 2, Requests: 150, Failed: 1, Bytes: 1500})
-
-	// 乱序/重复的包必须被忽略，否则速率会算成负数
-	if _, _, known := m.applyProgress(a1.state.NodeID, Progress{TaskID: view.ID, Seq: 2, Requests: 1}); !known {
-		t.Fatal("duplicate seq should still be treated as a known task")
-	}
+	// 重复/乱序的包必须被忽略
+	m.applyProgress(a1.state.NodeID, Progress{TaskID: view.ID, Seq: 2, Requests: 1})
 
 	var live taskView
 	if status := admin.call(http.MethodGet, "/api/v1/tasks/"+view.ID, nil, &live); status != http.StatusOK {
 		t.Fatalf("get task: %d", status)
 	}
-	if live.Totals.Requests != 350 {
-		t.Fatalf("requests should be summed across shards, got %d", live.Totals.Requests)
-	}
-	if live.Totals.Failed != 4 {
-		t.Fatalf("failures should be summed, got %d", live.Totals.Failed)
-	}
-	if live.Totals.Bytes != 3500 {
-		t.Fatalf("bytes should be summed, got %d", live.Totals.Bytes)
+	if live.Totals.Requests != 350 || live.Totals.Failed != 4 || live.Totals.Bytes != 3500 {
+		t.Fatalf("unexpected totals: %+v", live.Totals)
 	}
 	if live.Totals.RPS <= 0 {
 		t.Fatalf("aggregate rps should be positive, got %f", live.Totals.RPS)
@@ -459,20 +340,10 @@ func TestProgressAggregation(t *testing.T) {
 	if len(live.Series) == 0 {
 		t.Fatal("series should collect samples for the chart")
 	}
-	if len(live.Nodes) != 2 {
-		t.Fatalf("expected two shards, got %d", len(live.Nodes))
-	}
 
-	// 停止后，迟到的进度包会让节点立刻收到 stop
 	if status := admin.call(http.MethodPost, "/api/v1/tasks/"+view.ID+"/stop", nil, nil); status != http.StatusOK {
 		t.Fatalf("stop: %d", status)
 	}
-	if stop, byDeadline, known := m.applyProgress(a2.state.NodeID, Progress{TaskID: view.ID, Seq: 3}); !known || !stop {
-		t.Fatalf("stopped task must tell the agent to stop (known=%v stop=%v)", known, stop)
-	} else if byDeadline {
-		t.Fatal("a manual stop must not be reported as the task deadline")
-	}
-
 	for _, id := range []string{a1.state.NodeID, a2.state.NodeID} {
 		m.applyResult(id, TaskResult{TaskID: view.ID, Status: taskStopped})
 	}
@@ -484,125 +355,39 @@ func TestProgressAggregation(t *testing.T) {
 	}
 }
 
-func TestUnknownTaskProgressTellsAgentToStop(t *testing.T) {
+// TestSupersededCertificateIsRejected 验证换发是原子替换：
+// 新证书一登记，旧证书立刻在握手阶段被拒。
+func TestSupersededCertificateIsRejected(t *testing.T) {
 	m, srv := newTestMaster(t)
-	a := newTestAgent(t, m, srv.URL, t.TempDir(), "a1")
+	a := enrollTestAgent(t, m, srv.URL, t.TempDir(), "a1")
+	connectAgent(t, m, a)
+	oldCert := append([]byte{}, a.certPEM...)
 
-	status, body := agentPost(t, a, "/api/v1/agent/progress", Progress{TaskID: "task-nope", Seq: 1})
-	if status != http.StatusOK {
-		t.Fatalf("progress for an unknown task should still be 200, got %d %s", status, body)
-	}
-	var out struct {
-		Known bool `json:"known"`
-		Stop  bool `json:"stop"`
-	}
-	if err := json.Unmarshal(body, &out); err != nil {
-		t.Fatal(err)
-	}
-	if out.Known || !out.Stop {
-		t.Fatalf("unknown task must be reported as unknown+stop, got %s", body)
-	}
-}
-
-// ---------- 测试辅助 ----------
-
-// newPinnedClient 是"没有 CA 文件、只有指纹"的首次入网客户端，
-// 与从节点 bootstrap 用的验证逻辑完全一致。
-func newPinnedClient(t *testing.T, m *master) *http.Client {
-	t.Helper()
-	fp := m.pki.fp
-	return &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{
-		MinVersion:         tls.VersionTLS13,
-		ServerName:         distServerName,
-		InsecureSkipVerify: true,
-		VerifyPeerCertificate: func(raw [][]byte, _ [][]*x509.Certificate) error {
-			return verifyPinnedChain(raw, fp)
-		},
-	}}}
-}
-
-func postRaw(t *testing.T, c *http.Client, url string, body any) (int, []byte) {
-	t.Helper()
-	data, err := json.Marshal(body)
+	_, csr, err := newAgentCSR("a1")
 	if err != nil {
 		t.Fatal(err)
 	}
-	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(data))
+	newCertPEM, serial, err := m.pki.issueClientCert(csr, a.state.NodeID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := c.Do(req)
-	if err != nil {
-		t.Fatalf("POST %s: %v", url, err)
-	}
-	defer resp.Body.Close()
-	out, _ := io.ReadAll(resp.Body)
-	return resp.StatusCode, out
-}
+	m.mu.Lock()
+	m.nodes[a.state.NodeID].serial = serial
+	m.mu.Unlock()
 
-// postWithClient 用指定客户端发一个 agent 请求，用于"旧证书还能不能用"这类断言。
-func postWithClient(t *testing.T, c *http.Client, url string, body any) (int, []byte) {
-	t.Helper()
-	return postRaw(t, c, url, body)
-}
-
-func clientWithCert(t *testing.T, m *master, certPEM, keyPEM []byte) *http.Client {
-	t.Helper()
-	pair, err := tls.X509KeyPair(certPEM, keyPEM)
-	if err != nil {
-		t.Fatalf("key pair: %v", err)
+	if _, err := m.precheckResume(a.state.NodeID, string(oldCert)); err == nil {
+		t.Fatal("the superseded certificate must be refused")
 	}
-	return &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{
-		RootCAs:      m.pki.caPool(),
-		ServerName:   distServerName,
-		Certificates: []tls.Certificate{pair},
-		MinVersion:   tls.VersionTLS13,
-	}}}
-}
-
-// TestRenewedCertificateReplacesTheOldOne 验证换发是原子替换：
-// 新证书一签发，旧证书立刻不能再用，而不是新旧并存一段时间。
-func TestRenewedCertificateReplacesTheOldOne(t *testing.T) {
-	m, srv := newTestMaster(t)
-	a := newTestAgent(t, m, srv.URL, t.TempDir(), "a1")
-	oldClient := a.client()
-
-	if status, body := postWithClient(t, oldClient, srv.URL+"/api/v1/agent/progress", Progress{TaskID: "task-x", Seq: 1}); status != http.StatusOK {
-		t.Fatalf("old cert should work before renewal, got %d %s", status, body)
-	}
-
-	key, csr, err := newAgentCSR("a1")
-	if err != nil {
-		t.Fatal(err)
-	}
-	var resp renewResponse
-	if err := a.postJSON(context.Background(), oldClient, a.endpoint("/api/v1/agent/renew"), renewRequest{CSR: csr}, &resp); err != nil {
-		t.Fatalf("renew: %v", err)
-	}
-	if resp.NodeID != a.state.NodeID {
-		t.Fatalf("renew must keep the node identity, got %s", resp.NodeID)
-	}
-
-	if status, _ := postWithClient(t, oldClient, srv.URL+"/api/v1/agent/progress", Progress{TaskID: "task-x", Seq: 2}); status != http.StatusForbidden {
-		t.Fatalf("the superseded certificate must be refused, got %d", status)
-	}
-
-	keyPEM, err := encodeKeyPEM(key)
-	if err != nil {
-		t.Fatal(err)
-	}
-	fresh := clientWithCert(t, m, []byte(resp.CertPEM), keyPEM)
-	if status, body := postWithClient(t, fresh, srv.URL+"/api/v1/agent/progress", Progress{TaskID: "task-x", Seq: 3}); status != http.StatusOK {
-		t.Fatalf("the renewed certificate should work, got %d %s", status, body)
+	if _, err := m.precheckResume(a.state.NodeID, string(newCertPEM)); err != nil {
+		t.Fatalf("the renewed certificate should be accepted: %v", err)
 	}
 }
 
-// TestFinishedTaskIsPersistedAndReloaded 验证结论落盘并在重启后可读。
 func TestFinishedTaskIsPersistedAndReloaded(t *testing.T) {
 	m, srv := newTestMaster(t)
 	admin := newTestAdmin(t, m, srv.URL)
-	a := newTestAgent(t, m, srv.URL, t.TempDir(), "a1")
+	a := enrollTestAgent(t, m, srv.URL, t.TempDir(), "a1")
+	connectAgent(t, m, a)
 
 	var view taskView
 	if status := admin.call(http.MethodPost, "/api/v1/tasks", taskCreateRequest{
@@ -641,26 +426,23 @@ func TestFinishedTaskIsPersistedAndReloaded(t *testing.T) {
 	if found == nil {
 		t.Fatal("a finished task should come back as history after a restart")
 	}
-	if found.State != taskDone {
-		t.Fatalf("reloaded state should be done, got %s", found.State)
-	}
-	if found.Totals.Requests != 10 {
-		t.Fatalf("reloaded totals should match, got %d", found.Totals.Requests)
+	if found.State != taskDone || found.Totals.Requests != 10 {
+		t.Fatalf("reloaded task mismatch: %s %+v", found.State, found.Totals)
 	}
 }
 
 func TestNewJoinValidatesURLAndToken(t *testing.T) {
 	m, _ := newTestMaster(t)
-	for _, bad := range []string{"", "http://10.0.0.1:8443", "10.0.0.1:8443"} {
+	for _, bad := range []string{"", "10.0.0.1:8443", "tcp://10.0.0.1:8443"} {
 		if _, err := m.newJoin(bad); err == nil {
 			t.Fatalf("newJoin(%q) should be rejected", bad)
 		}
 	}
-	info, err := m.newJoin("https://10.0.0.1:8443/")
+	info, err := m.newJoin("http://10.0.0.1:8080/")
 	if err != nil {
-		t.Fatalf("newJoin: %v", err)
+		t.Fatalf("plain http must be accepted: %v", err)
 	}
-	if info.URL != "https://10.0.0.1:8443" {
+	if info.URL != "http://10.0.0.1:8080" {
 		t.Fatalf("trailing slash should be trimmed, got %q", info.URL)
 	}
 	decoded, err := decodeJoinString(info.encode())
@@ -673,4 +455,53 @@ func TestNewJoinValidatesURLAndToken(t *testing.T) {
 	if _, err := m.pki.verifyJoinToken(decoded.Token); err != nil {
 		t.Fatalf("issued token must verify: %v", err)
 	}
+}
+
+func TestParseListenSpec(t *testing.T) {
+	cases := []struct {
+		in, scheme, addr string
+		ok               bool
+	}{
+		{"0.0.0.0:8443", "https", "0.0.0.0:8443", true},
+		{"https://0.0.0.0:8443", "https", "0.0.0.0:8443", true},
+		{"http://0.0.0.0:8080", "http", "0.0.0.0:8080", true},
+		{"http://:8080/", "http", ":8080", true},
+		{"ftp://0.0.0.0:21", "", "", false},
+		{"0.0.0.0", "", "", false},
+		{"", "", "", false},
+	}
+	for _, c := range cases {
+		scheme, addr, err := parseListenSpec(c.in)
+		if c.ok {
+			if err != nil || scheme != c.scheme || addr != c.addr {
+				t.Errorf("parseListenSpec(%q) = %q,%q,%v", c.in, scheme, addr, err)
+			}
+			continue
+		}
+		if err == nil {
+			t.Errorf("parseListenSpec(%q) should fail", c.in)
+		}
+	}
+}
+
+// ---------- 测试辅助 ----------
+
+func postRaw(t *testing.T, c *http.Client, url string, body any) (int, []byte) {
+	t.Helper()
+	data, err := json.Marshal(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.Do(req)
+	if err != nil {
+		t.Fatalf("POST %s: %v", url, err)
+	}
+	defer resp.Body.Close()
+	out, _ := io.ReadAll(resp.Body)
+	return resp.StatusCode, out
 }

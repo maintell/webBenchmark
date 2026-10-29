@@ -38,7 +38,7 @@ func (b statsBaseline) snapshot(started time.Time, conc int) Progress {
 }
 
 // benchOptions 把线上任务参数翻译成本地压测引擎认识的选项。
-// 两套参数刻意保持一一对应：分布式与单机测的必须是同一件事，
+// 两套参数刻意一一对应：分布式与单机测的必须是同一件事，
 // 否则"本机 200MB/s、集群 120MB/s"这种结论就没法解释。
 func (t *TaskSpec) benchOptions() *benchOptions {
 	mode, err := parseProto(t.Proto)
@@ -82,10 +82,10 @@ func clearLastError() {
 
 // runDistTask 在本机执行一条分布式任务，直到到点、被主控叫停或进程退出。
 //
-// onSample 每秒被调用一次；返回值 stop 表示"现在就该停"，
-// byDeadline 表示停的原因是任务自己到点了（这是正常完成，不是被打断）。
-// 主控也可能通过这一帧的响应来停止任务，所以它同时是停止信号的通道。
-func runDistTask(ctx context.Context, spec *TaskSpec, conc int, onSample func(Progress) (stop, byDeadline bool)) TaskResult {
+// stopCh 传的是"为什么停"：deadline 表示任务自己跑满了时长（正常完成），
+// stopped 表示控制台按停。两者必须区分，否则一条跑满时长的任务会被
+// 记成"已停止"，历史列表里全是误报。
+func runDistTask(ctx context.Context, spec *TaskSpec, conc int, onSample func(Progress), stopCh <-chan string) TaskResult {
 	if conc < 1 {
 		conc = 1
 	}
@@ -103,7 +103,7 @@ func runDistTask(ctx context.Context, spec *TaskSpec, conc int, onSample func(Pr
 	base := statsNow()
 	started := time.Now()
 
-	runCtx, cancel := context.WithTimeout(ctx, duration)
+	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
 	var wg sync.WaitGroup
@@ -115,29 +115,38 @@ func runDistTask(ctx context.Context, spec *TaskSpec, conc int, onSample func(Pr
 		}()
 	}
 
-	stoppedByUser := false
+	deadline := time.NewTimer(duration)
+	defer deadline.Stop()
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 
+	reason := "deadline"
 loop:
 	for {
 		select {
-		case <-runCtx.Done():
+		case <-deadline.C:
+			reason = "deadline"
+			break loop
+		case r := <-stopCh:
+			if r != "" {
+				reason = r
+			} else {
+				reason = "stopped"
+			}
+			break loop
+		case <-ctx.Done():
+			reason = "stopped"
 			break loop
 		case <-ticker.C:
 			if onSample != nil {
-				stop, byDeadline := onSample(base.snapshot(started, conc))
-				if stop {
-					stoppedByUser = !byDeadline
-					cancel()
-					break loop
-				}
+				onSample(base.snapshot(started, conc))
 			}
 		}
 	}
+	cancel()
 	wg.Wait()
 
-	// 收尾再补一帧：短任务（比如 2 秒）常常只有一帧采样，
+	// 收尾再补一帧：短任务常常只有一帧采样，
 	// 主控拿不到第二个点就算不出速率，曲线的最后一秒也永远是空的。
 	if onSample != nil {
 		onSample(base.snapshot(started, conc))
@@ -151,12 +160,11 @@ loop:
 		ElapsedMs: time.Since(started).Milliseconds(),
 	}
 	switch {
-	case ctx.Err() != nil, stoppedByUser:
-		// ctx 被取消 = 主控下发 stop 或进程要退出，都是被打断。
+	case reason != "deadline":
 		res.Status = taskStopped
 	case res.Requests == 0:
 		// 一个请求都没发出去，说明是配置或链路问题（DNS、证书、地址族），
-		// 这种情况必须让主控看到 error，而不是一个漂亮的全零结果。
+		// 必须让主控看到 error，而不是一个漂亮的全零结果。
 		res.Status = taskErrored
 		res.Error = shortText(lastErrorMessage(), 300)
 		if res.Error == "" {

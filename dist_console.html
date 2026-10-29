@@ -34,6 +34,7 @@
         <h2>节点</h2>
         <div class="actions">
           <button id="select-all" class="ghost small" type="button">全选</button>
+          <button id="ssh-btn" class="ghost small" type="button">SSH 安装</button>
           <button id="join-btn" class="small" type="button">加入命令</button>
         </div>
       </div>
@@ -159,7 +160,33 @@
       <button id="copy-join" class="ghost" type="button">复制命令</button>
       <button class="primary" value="close">完成</button>
     </div>
-    <p class="note">令牌只对一台机器有效，到期自动失效。节点身份保存在它的数据目录里，重启不需要重新加入。</p>
+    <p class="note">令牌只对一台机器有效，到期自动失效。节点身份保存在它的数据目录里，重启不需要重新加入。主控是纯 http 时请把地址写成 http://，主从通道仍然是端到端加密的。</p>
+  </form>
+</dialog>
+
+<dialog id="ssh-dialog">
+  <form method="dialog" class="dialog-body">
+    <h3>通过 SSH 安装节点</h3>
+    <label class="col">目标主机（每行一个，可写 host 或 host:port）
+      <textarea id="ssh-hosts" rows="4" placeholder="10.0.0.11&#10;10.0.0.12:2222"></textarea>
+    </label>
+    <div class="row">
+      <label class="col">SSH 用户<input id="ssh-user" type="text" value="root"></label>
+      <label class="col">端口<input id="ssh-port" type="number" value="22" min="1" max="65535"></label>
+    </div>
+    <div class="row">
+      <label class="col">密码<input id="ssh-password" type="password" autocomplete="off"></label>
+      <label class="col">或私钥路径<input id="ssh-key" type="text" placeholder="主控本机上的私钥绝对路径"></label>
+    </div>
+    <div class="row">
+      <label class="col span2">主控地址（从节点可达）<input id="ssh-master-url" type="text"></label>
+    </div>
+    <p class="muted">主控会把自己的可执行文件上传到目标机的 ~/.webBenchmark-agent 并在后台启动；SSH 凭据只在本次连接里用一次，不落盘。</p>
+    <pre id="ssh-log" class="cmd"></pre>
+    <div class="dialog-actions">
+      <button id="ssh-run" class="primary" type="button">开始安装</button>
+      <button class="ghost" value="close">关闭</button>
+    </div>
   </form>
 </dialog>
 
