@@ -59,16 +59,21 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist
-          build() {
-            echo "building $4"
-            CGO_ENABLED=0 GOOS="$1" GOARCH="$2" go build -trimpath -ldflags "-s -w" -o "dist/$4" .
-          }
-          build linux   amd64 webBenchmark_linux_x64
-          build linux   arm   webBenchmark_linux_arm
-          build windows amd64 webBenchmark_x64.exe
-          build freebsd amd64 webBenchmark_bsd_x64.exe
-          ( cd dist && sha256sum * > SHA256SUMS )
-          ls -l dist
+
+          CGO_ENABLED=0 GOOS=linux   GOARCH=amd64 \
+            go build -trimpath -ldflags "-s -w" -o dist/webBenchmark_linux_x64 .
+          CGO_ENABLED=0 GOOS=linux   GOARCH=arm \
+            go build -trimpath -ldflags "-s -w" -o dist/webBenchmark_linux_arm .
+          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 \
+            go build -trimpath -ldflags "-s -w" -o dist/webBenchmark_x64.exe .
+          CGO_ENABLED=0 GOOS=freebsd GOARCH=amd64 \
+            go build -trimpath -ldflags "-s -w" -o dist/webBenchmark_bsd_x64.exe .
+
+          cd dist
+          sha256sum webBenchmark_linux_x64 webBenchmark_linux_arm \
+                    webBenchmark_x64.exe   webBenchmark_bsd_x64.exe > SHA256SUMS
+          cat SHA256SUMS
+          ls -l
 
       - name: Extract release notes from the changelog
         run: |
