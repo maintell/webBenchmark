@@ -95,7 +95,7 @@ func TestNewDialerKeepsRequestedPort(t *testing.T) {
 	port := probe.Addr().(*net.TCPAddr).Port
 	probe.Close()
 
-	dial := newDialer(ipArray{"127.0.0.1"}, familyAny)
+	dial := newDialer(ipArray{"127.0.0.1"}, familyAny, 0)
 	conn, err := dial(context.Background(), "tcp", net.JoinHostPort("example.invalid", strconv.Itoa(port)))
 	if err == nil {
 		conn.Close()
@@ -167,9 +167,11 @@ func TestSendOnceCountsTruncatedBodyAsFailure(t *testing.T) {
 	opts := &benchOptions{timeout: 150 * time.Millisecond}
 	transport := newTransport(opts)
 	defer transport.CloseIdleConnections()
-	client := &http.Client{Transport: transport, Timeout: opts.timeout}
+	// 和线上一致：不设 client.Timeout，让空闲看门去发现"再也没有数据进来"。
+	client := &http.Client{Transport: transport}
 
 	beforeFailed := stats.failed.Load()
+	beforeTimedOut := stats.timedOut.Load()
 	beforeRequests := stats.requests.Load()
 
 	if sendOnce(context.Background(), client, opts, srv.URL) {
@@ -178,8 +180,101 @@ func TestSendOnceCountsTruncatedBodyAsFailure(t *testing.T) {
 	if got := stats.failed.Load(); got != beforeFailed+1 {
 		t.Fatalf("failed counter = %d, want %d", got, beforeFailed+1)
 	}
+	// 半截卡住属于"我们自己的秒表到点"，要单独计入 timeout，
+	// 不能和"目标拒绝"混成一个数字。
+	if got := stats.timedOut.Load(); got != beforeTimedOut+1 {
+		t.Fatalf("timedOut counter = %d, want %d", got, beforeTimedOut+1)
+	}
 	if got := stats.requests.Load(); got != beforeRequests {
 		t.Fatalf("requests counter = %d, want it to stay at %d", got, beforeRequests)
+	}
+}
+
+// 回归：慢但持续在传的响应不能被 -t 判死。
+// 旧实现用 client.Timeout（整个请求的总时限），一个 76 MB 的文件在 1 MB/s 上
+// 必然超过默认 30 秒，于是每个请求都记失败——目标没问题，是秒表掐得太死。
+func TestSendOnceToleratesSlowButSteadyBody(t *testing.T) {
+	const chunk = 8192
+	const chunks = 12 // 12 * 50ms = 600ms，远超下面 300ms 的 -t
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", strconv.Itoa(chunk*chunks))
+		w.WriteHeader(http.StatusOK)
+		for i := 0; i < chunks; i++ {
+			w.Write(make([]byte, chunk))
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+	}))
+	defer srv.Close()
+
+	// 空闲阈值给到单次间隔的 6 倍：机器负载再高，也不能靠"这一格刚好没卡"来过。
+	opts := &benchOptions{timeout: 300 * time.Millisecond}
+	transport := newTransport(opts)
+	defer transport.CloseIdleConnections()
+	// 线上就是这么建的：不设 client.Timeout，超时完全交给空闲看门。
+	client := &http.Client{Transport: transport}
+
+	if !sendOnce(context.Background(), client, opts, srv.URL) {
+		t.Fatal("a steady body that outlives -t must not be counted as a failure")
+	}
+}
+
+// 4xx/5xx 以前被当作成功：压测结果可以全绿，实际全在报错。
+func TestSendOnceCountsErrorStatusAsRejected(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		w.Write([]byte("denied"))
+	}))
+	defer srv.Close()
+
+	opts := &benchOptions{timeout: 2 * time.Second}
+	transport := newTransport(opts)
+	defer transport.CloseIdleConnections()
+	client := &http.Client{Transport: transport}
+
+	beforeRejected := stats.rejected.Load()
+	beforeRequests := stats.requests.Load()
+
+	if sendOnce(context.Background(), client, opts, srv.URL) {
+		t.Fatal("a 403 response must not be reported as a successful request")
+	}
+	if got := stats.rejected.Load(); got != beforeRejected+1 {
+		t.Fatalf("rejected counter = %d, want %d", got, beforeRejected+1)
+	}
+	if got := stats.requests.Load(); got != beforeRequests {
+		t.Fatalf("requests counter = %d, want it to stay at %d", got, beforeRequests)
+	}
+}
+
+// 空闲看门在请求正常结束后会 cancel 请求 ctx。这一步如果太早，
+// Transport 会直接拆连接，每条请求都要重新握手，压测就变成测握手了。
+func TestSendOnceKeepsConnectionReusable(t *testing.T) {
+	var conns int32
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("ok"))
+	}))
+	srv.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+		if state == http.StateNew {
+			atomic.AddInt32(&conns, 1)
+		}
+	}
+	srv.Start()
+	defer srv.Close()
+
+	opts := &benchOptions{timeout: 2 * time.Second}
+	transport := newTransport(opts)
+	defer transport.CloseIdleConnections()
+	client := &http.Client{Transport: transport}
+
+	for i := 0; i < 5; i++ {
+		if !sendOnce(context.Background(), client, opts, srv.URL) {
+			t.Fatalf("request %d failed", i)
+		}
+	}
+	if got := atomic.LoadInt32(&conns); got != 1 {
+		t.Fatalf("server saw %d connections for 5 sequential requests, want 1 (keep-alive broke)", got)
 	}
 }
 

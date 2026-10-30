@@ -2,6 +2,7 @@
 bin
 
 # build outputs (build.bat / go build)
+webBenchmark.exe
 webBenchmark_linux_x64
 webBenchmark_linux_arm
 webBenchmark_x64.exe

@@ -1,5 +1,96 @@
 # Changelog
 
+## 0.14
+
+### Changed — auto mode converges on the real optimum instead of the nearest power of two
+
+- **The climb step is configurable and defaults to 1.5 instead of a hard-coded doubling**
+  (`-ramp-step`). Doubling tested 4, 8, 16, 32 and nothing in between: with a real peak at
+  22 connections the ramp settled on 16 and gave up roughly a quarter of the throughput,
+  while one step further landed in the region where more connections are *slower*.
+- **The first window is warm-up and no longer judged.** It carries the handshakes, DNS and
+  TCP slow start; on the test box it measured 46.9 MB/s where the steady state was
+  62.6 MB/s, so using it as the baseline biased the whole ramp downwards.
+- **A plateau now gets one breakout probe before the ramp gives up.** One unlucky level is
+  indistinguishable from a real plateau, and that is not hypothetical: the ramp settled on
+  6 connections at 48.8 MB/s while 8 connections did 62.6 MB/s on the same box, because the
+  level in between happened to measure low twice in a row.
+- **The peak follows the highest rate actually observed**, even when the gain over the
+  previous peak is inside the dead zone. The dead zone decides whether to keep climbing; it
+  must not throw away a better measurement. Measured example: 9 connections 68.0 MB/s,
+  14 connections 72.1 MB/s — the old rule discarded the 72.1 and settled on 9.
+- **A duel decides the final level** (`-ramp-duel`, default on). Before settling, the chosen
+  level and one step above are both re-measured over the same number of windows and the
+  faster one wins. The peak often comes from a single window, and one window is exactly the
+  thing that cannot be trusted on a noisy link.
+- **A refine pass bisects the bracket the climb leaves behind** (`-ramp-refine-gain`,
+  default 3%). It keeps `low < best < high` and always probes the wider side, because
+  probing only upwards has a blind spot: with the peak at 37 and 32/48 already measured, the
+  first probe lands on 39, which beats 32, and a one-sided search never looks back down.
+  Two windows per candidate are averaged before the candidate is believed, and a tie keeps
+  the smaller concurrency.
+- **The dead zone adapts to the link.** Two windows measured at the same level give a noise
+  estimate; when that spread exceeds the fixed 10%, the spread becomes the gate, so a noisy
+  link stops promoting noise to a trend. A link that produces no bytes at all settles at the
+  starting level instead of ramping to the cap.
+
+### Fixed — `-t` is an idle timeout, not a total deadline
+
+- **A slow but steady download is no longer a failure.** `-t` was wired to
+  `http.Client.Timeout`, a deadline for the whole request: pulling a 76 MB file at 1 MB/s
+  always exceeded the default 30 s, so every request failed although the target never
+  misbehaved. Those false failures also poisoned the ramp, which stops climbing at any
+  window "containing failures". Timeouts are now idle watchdogs — a request fails only when
+  no byte arrives for `-t` seconds, and a steady transfer runs to completion however long it
+  takes.
+- **`Failed` is split into `timeout:` and `rejected:`** so an idle timeout cannot be read as
+  the target pushing back.
+- **4xx/5xx responses count as failures.** They used to be read to the end and counted as
+  successful requests, which could report a fully green run against a target answering `403`
+  to everything.
+
+### Added — what a low-spec machine actually spends
+
+- **`-raw`** measures socket throughput without decrypting: TLS handshake, write the
+  request, then discard the encrypted stream — on Linux through `splice()` straight to
+  `/dev/null`, so no copy to user space, no AES-GCM, no HTTP parsing. It reports `N sent`
+  instead of `N req` and cannot see status codes, which is the trade: it answers "what can
+  this link carry" and nothing about whether the target is healthy.
+- **`CPU:` breaks out softirq.** The line now reads `45.3% proc / 89.9% busy   softirq
+  21.4%`, computed from consecutive `/proc/stat` snapshots rather than a since-boot average.
+  Softirq is the receive-side kernel cost — the half of the picture a user-space tool cannot
+  optimise, and the one that decides whether a fast client is worth adding.
+- **`-rcvbuf`** caps the kernel receive buffer per connection (default 0 — auto-tune).
+  Measured on a 1 vCPU box: 16 connections held 44 MB of kernel socket memory while the
+  process itself used 18 MB, and that was enough to push a 1 GB host with a 150 MB margin
+  into swap. Capping it is a trade, not a free win: setting the buffer disables BDP
+  auto-tuning, so on a long-RTT link the per-connection ceiling drops with it.
+- **The ramp stops when free memory is low.** Before adding connections it checks
+  `MemAvailable` against `max(5% of RAM, 64 MB)`; below that it settles at the measured
+  optimum and says why on stderr. Pushing a swapping box harder measures the swap, not the
+  target.
+- **`Mem:` reports swap usage.** A box that already has a gigabyte swapped out looks fine in
+  every other figure while its throughput is being decided by the disk.
+- **The status bar is a table now.** Every line used to be its own ad-hoc sentence, and the
+  interface list printed one line per NIC every second — a host running docker showed a wall
+  of `Nic:br-…,Recv …` that pushed the numbers you actually watch off the screen. Labels now
+  form a fixed column, the ramp and interface lists are aligned tables with headers, and the
+  interface table keeps only the four busiest plus a `(others) N quiet` count, so twelve
+  interfaces cost six lines instead of twelve. Long names are shortened in the middle
+  (`br-0...64ff4`) because `br-`/`veth` prefixes are all identical and the distinguishing
+  part is at the end.
+- **`CPU:` no longer blames the load generator for everyone's CPU.** It printed only
+  `cpu.Percent(0, false)`, i.e. the whole box. On a 1 vCPU host at 45 MB/s that number sat at
+  100% while the process itself used 31% of the core — the rest was other daemons and network
+  softirq, which sent the investigation after the wrong bottleneck. The line now reads
+  `23.3% proc / 100.00% sys` and `Mem` shows this process's RSS beside system usage, so
+  "is the generator the bottleneck" is answered by looking instead of guessing.
+
+### Note
+
+- `-t` changed meaning. If you relied on it as a hard per-request deadline, put the deadline
+  outside the process: `timeout -k 5 -s INT 600 ./webBenchmark ...`.
+
 ## 0.13
 
 ### Fixed

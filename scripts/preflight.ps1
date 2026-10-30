@@ -126,7 +126,8 @@ Step 'README 版本号与代码一致' {
 Step 'README 覆盖了所有命令行开关' {
     $source = Get-Content main.go -Raw
     $names = [System.Collections.Generic.List[string]]::new()
-    foreach ($m in [regex]::Matches($source, 'flag\.(?:Bool|Int|String)\("([^"]+)"')) {
+    # 类型必须覆盖全部 flag.X(...)：漏掉 Float64 之类会让新开关静默逃过这道门禁。
+    foreach ($m in [regex]::Matches($source, 'flag\.(?:Bool|Int|Int64|Uint|String|Float64|Duration)\("([^"]+)"')) {
         $names.Add($m.Groups[1].Value)
     }
     foreach ($m in [regex]::Matches($source, 'flag\.Var\(&\w+,\s*"([^"]+)"')) {

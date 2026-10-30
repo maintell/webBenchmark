@@ -3,7 +3,7 @@ http benchmark tool to ran out your server bandwidth.
 
 用户在使用本工具前请先查看授权及免责声明，webBenchmark仅仅是一个用于测试网页服务器性能的工具，用作其他用途，后果自负。
 
-Current version: 0.13 — see [CHANGELOG.md](CHANGELOG.md) for what changed.
+Current version: 0.14 — see [CHANGELOG.md](CHANGELOG.md) for what changed.
 
 - random User-Agent on every Request
 - customizable Referer Url,
@@ -31,6 +31,22 @@ Current version: 0.13 — see [CHANGELOG.md](CHANGELOG.md) for what changed.
     webBenchmark -c [COUNT] -s [URL] -r [REFERER]
     -c int
           concurrent routines; omit or 0 to ramp up automatically until throughput stops improving
+    -ramp-step float
+          auto mode: multiplicative concurrency step while climbing (default 1.5, i.e.
+          4 -> 6 -> 9 -> 14 -> 21 ...). Doubling used to skip straight past the real peak
+          and land in the region where more connections are slower
+    -ramp-gain float
+          auto mode: how much a window must beat the historical peak to count as an
+          improvement while climbing (default 0.1, raised automatically when the link is
+          too noisy to tell a real gain from a swing)
+    -ramp-refine-gain float
+          auto mode: the smaller gain that counts as an improvement during the refine
+          pass (default 0.03, must be below -ramp-gain)
+    -ramp-window int
+          auto mode: length of one measurement window in seconds (default 4)
+    -ramp-duel
+          auto mode: before settling, measure the chosen level and one step above with
+          the same number of windows and keep the faster one (default true)
     -s string
           target url, must start with http:// or https://
     -r string
@@ -66,13 +82,24 @@ Current version: 0.13 — see [CHANGELOG.md](CHANGELOG.md) for what changed.
     -nr
           open a new TCP connection for every request instead of reusing connections
     -t int
-          per-request timeout in seconds, 0 disables it (default 30)
+          idle timeout in seconds: a request fails only when no data arrives for this
+          long, 0 disables it (default 30). A slow but steady download never times out,
+          however long the whole file takes
     -4
           force IPv4 only; this is the default
     -6
           force IPv6 only instead of the default IPv4
     -dns string
           dns server used for the target ip display (default "8.8.8.8")
+    -raw
+          measure raw socket throughput: after the TLS handshake the encrypted stream
+          is discarded without decrypting. No status codes, no per-request accounting;
+          tcp + http1 only (default false)
+    -rcvbuf int
+          cap the kernel receive buffer per connection in bytes (default 0 = let the
+          kernel auto-tune). Only for machines where RAM, not bandwidth, is the
+          constraint: setting it disables BDP auto-tuning, so a high-RTT link gets a
+          lower per-connection ceiling. TCP only, ignored by -proto http3
 
 # Download
 
@@ -99,6 +126,13 @@ Asset names:
     ./webBenchmark_linux_x64 -s https://target.url -H 'regid:123' -H 'sign:Random10'
     # same, but open a fresh TCP connection for every request instead of reusing it
     ./webBenchmark_linux_x64 -s https://target.url -nr
+    # measure the socket rather than the protocol: discard the encrypted stream without
+    # decrypting it. Roughly halves the client CPU; no status codes, no request counter
+    ./webBenchmark_linux_x64 -raw -c 48 -s https://target.url
+    # low-RAM client: cap the kernel receive buffer per connection (1MB total instead of 25MB)
+    ./webBenchmark_linux_x64 -c 8 -rcvbuf 262144 -s https://target.url
+    # noisy link: longer measurement windows make the automatic ramp less jittery
+    ./webBenchmark_linux_x64 -s https://target.url -ramp-window 8
 
 # Distributed mode
 
@@ -282,35 +316,91 @@ returned by it; the agent channel authenticates inside the encrypted WebSocket h
   client address, one h2 connection is just as BDP limited as one h1 connection. Measured
   on the same host: 508 KB/s with eight http1 connections versus 460 KB/s with http2.
 
-- **Auto ramp (default).** Without `-c` the tool starts at 4 connections, measures a
-  4 second window, and doubles whenever throughput beats the best result so far by more
-  than 10%. It stops after two consecutive windows without such a gain and then holds the
-  concurrency that actually produced the **best** result — not the last one it tried, so a
-  probe that overshoots does not leave you running at a worse setting. A window containing
-  failures is never treated as an improvement. The progress is written to stderr once and
-  stays visible in the status bar:
+- **Auto ramp (default).** Without `-c` the tool finds the concurrency that actually
+  produces the most throughput, in two passes.
+
+  *Climb.* The first window is thrown away as warm-up: it carries the handshakes, DNS and
+  TCP slow start, and measured about 40% of the steady state on the test box, which would
+  bias the starting level downwards. After that, a window (`-ramp-window`, default 4 s)
+  that beats the historical peak by more than `-ramp-gain` (default 10%) multiplies the
+  concurrency by `-ramp-step` (default 1.5). Two consecutive windows without such a gain
+  end the climb — but not before one **breakout probe** one step higher. A plateau caused
+  by one unlucky level is otherwise indistinguishable from a real one, and that is exactly
+  how the ramp once settled on 6 connections at 48.8 MB/s while 8 connections did
+  62.6 MB/s on the same box. The breakout probe is judged without the dead zone: after two
+  windows of a confirmed plateau, merely beating the previous peak means the plateau was
+  false and the climb resumes. A window containing failures never counts as an improvement.
+
+  The peak, and therefore the level the ramp settles on, follows the highest rate actually
+  observed even when the gain over the previous peak is inside the dead zone. The dead zone
+  decides whether to keep climbing; it must not throw away a better measurement.
+
+  *Refine.* The climb leaves a bracket: the level that measured best (`low`) and the first
+  level confirmed worse (`high`). The refine pass probes geometric midpoints inside that
+  bracket, two windows per candidate averaged, and accepts a candidate only when it beats
+  the incumbent by `-ramp-refine-gain` (default 3%). It keeps three points (`low < best <
+  high`) and always probes whichever side of the bracket is wider, because probing only
+  upwards has a blind spot: with the real peak at 37 and 32/48 already measured, the first
+  probe lands on 39, which beats 32, and a one-sided search then never looks back down and
+  reports 39. It settles once both sides are within `max(2, 5%)` of the incumbent, and on
+  a tie it keeps the **smaller** concurrency — same throughput, fewer connections and less
+  CPU.
+
+  The settled level is the one that measured best, never the last one tried, so a probe
+  that overshoots does not leave you running at a worse setting.
+
+  *Duel.* Before the ramp declares itself settled it re-measures the chosen level and one
+  step above it, the same number of windows each, and keeps the faster one. The peak may
+  have come from a single window, and a single window on a long haul link swings by ±20%:
+  one run had 9 connections at 61.4 MB/s from one window while 14 connections measured
+  68.1 and 72.1 in two, and the ramp stopped at 9. The duel is what separates "a lucky
+  window" from "actually faster". It costs four windows; `-ramp-duel=false` turns it off.
+
+  Both passes run against
+  the historical peak rather than the previous window, because a single window on a long
+  haul link swings by 30%; when two windows measured at the *same* level disagree by more
+  than the dead zone, that spread is used as the gate instead of the fixed 10%, so a noisy
+  link stops treating noise as a trend. A link that produces no bytes at all settles at the
+  starting level instead of ramping to the cap.
+
+  Progress is written to the status bar. Labels form a fixed column and the two variable
+  blocks (ramp, interfaces) are tables, so numbers line up and can be scanned vertically:
 
   ```
-  Mode:auto  Phase:settled  Conc:8  Peak:552.000KB/s@8
-  Requests:2  Failed:0  Loaded:14.277MB  Avg:503.839KB/s  Elapsed:29s
-  Ramp:
-    conc=4     472.000KB/s  118.000KB/s/conn       -
-    conc=8     480.000KB/s   60.000KB/s/conn   +1.7%
-    conc=8     552.000KB/s   69.000KB/s/conn  +15.0%
-    conc=16    440.000KB/s   27.500KB/s/conn  -20.3%
-    conc=16    523.412KB/s   32.713KB/s/conn   -5.2%  <- plateau
+  Target  https://example.com/big.iso
+  IP      203.0.113.7,203.0.113.8
+  Mode    auto refine   conc 19   bracket 16..24
+  Rate    avg 41.905MB/s   now 43.120MB/s
+  Volume  1.204GB   3 req   0 failed   31s
+  CPU     23.3% proc / 89.9% busy   softirq 21.4%   load 6.63 2.80 2.70
+  Mem     11.1MB rss / 80.3% sys
+  Ramp    conc        rate   per-conn   vs peak
+             6  28.400MB/s  4.733MB/s        -
+             9  51.020MB/s  5.669MB/s   +79.6%
+            14  68.320MB/s  4.880MB/s   +33.9%
+            21  70.110MB/s  3.339MB/s    +2.6%
+            21  66.240MB/s  3.154MB/s    -5.5%   plateau
+  Net     iface            down/s       up/s   total down/up
+          eth0         49.124MB/s 789.361KB/s   118.115GB/48.403GB
+          lo           303.000B/s 303.000B/s   30.616GB/30.616GB
+          (others)                             (6 quiet)
   ```
 
-  The `s/conn` column is the diagnostic for "more concurrency but no more
-  throughput": when it divides roughly in half every time the concurrency doubles while
-  the total stays flat, the server is capping you per client address and no amount of
-  parallel connections will help. Measured example: one host served ~450 KB/s to a single
-  address no matter whether that address used 1 or 8 connections, and two different
-  addresses running at the same time each still got ~450 KB/s.
+  The interface table is sorted by current traffic, capped at the four busiest, and folds
+  every idle `docker`/`veth`/`lo` into the `(others)` count — a host with a dozen virtual
+  interfaces used to print a dozen lines every second and push everything else off screen.
+  Those counters belong to the **host**, not to the run: on a box that also runs proxies or
+  containers, `eth0` reads higher than `Rate now`, and the totals include traffic this
+  benchmark never sent.
 
-  Comparisons are made against the historical peak rather than the previous window,
-  because a single 4 second window on a long haul link can swing by 30%. Pass `-c N` for
-  a fixed level when you already know what you want.
+  The `per-conn` column is the diagnostic for "more concurrency but no more
+  throughput": when it keeps falling while the total stays flat, the server is capping you
+  per client address and no amount of parallel connections will help. Measured example: one
+  host served ~450 KB/s to a single address no matter whether that address used 1 or 8
+  connections, and two different addresses running at the same time each still got
+  ~450 KB/s.
+
+  Pass `-c N` for a fixed level when you already know what you want.
 
 - **Live concurrency keys (auto mode, interactive terminal only).** While the run is in
   progress you can steer the concurrency without restarting:
@@ -366,15 +456,56 @@ returned by it; the agent channel authenticates inside the encrypted WebSocket h
   depends on which address family the resolver happened to prefer is not a benchmark, so
   IPv4 is the default and `-6` is the explicit opt in. If the target has no IPv4 address
   the tool stops with an error telling you to add `-6`, rather than silently switching.
-- **Status bar.** `Requests` / `Failed` / `Loaded` count completed responses, failed
-  requests and downloaded bytes, `Avg` is the average throughput of the whole run and
-  `Elapsed` its duration. A `LastError` line appears as soon as something fails, and each
-  distinct error is printed once on stderr, so a run that produces no traffic tells you
-  why instead of just showing `Failed` climbing. A request only counts as completed once
-  its body has been read to the end, so a body cut short by `-t` shows up in `Failed`
-  instead of silently inflating `Requests`. If `Failed` climbs while `Loaded` stays low,
-  either the target is slow or `-t` is too short for the file size you are pulling — raise
-  `-t` (or set `-t 0`) before trusting the throughput number.
+- **Status bar.** `Rate` is the average throughput of the run next to the current
+  one-second rate, `Volume` is downloaded bytes plus completed / failed requests and the
+  elapsed time. `Failed` is broken down into `timeout:` (nothing arrived for
+  `-t` seconds) and `rejected:` (the target answered 4xx/5xx, refused the connection or
+  broke it mid-body), so an idle timeout is never mistaken for the target pushing back.
+  Status codes above 399 used to be counted as *successful* requests, which could report a
+  green run against a target that answered nothing but `403`. A `LastError` line appears
+  as soon as something fails, and each distinct error is printed once on stderr, so a run
+  that produces no traffic tells you why instead of just showing `Failed` climbing. A
+  request only counts as completed once its body has been read to the end, so a body cut
+  short shows up in `Failed` instead of silently inflating `Requests`.
+- **`CPU:` has two numbers, and the difference matters.** `CPU 45.3% proc / 89.9% busy   softirq 21.4%`
+  means this process used 17.3% of one core while the machine as a whole was saturated. The
+  single number this line used to print was the machine-wide figure, which reads like "the
+  load generator is the bottleneck" when it usually is not: measured on a 1 vCPU box at
+  45 MB/s, the process itself used 31% of the core and the rest was other daemons plus
+  network softirq. `Memory:` likewise shows this process's RSS next to machine-wide usage.
+  Diagnose from the first number; the second one tells you what the box is doing.
+- **Small machines.** Two costs scale with concurrency and neither shows up in the
+  process's own RSS: the kernel receive buffer per connection (auto-tuned to the
+  bandwidth-delay product — about 2.5 MB on a 0.8 s RTT link) and the CPU of the network
+  stack. Sixteen connections measured 44 MB of kernel socket memory, which on a 1 GB box
+  with a 150 MB free margin is enough to push everything else into swap; the swap traffic
+  then becomes disk I/O and throughput collapses for reasons that have nothing to do with
+  the target. On such a host, watch the `swap ... used` figure on the `Mem` line, cap the
+  buffer with `-rcvbuf`, and note that the ramp stops itself when free memory falls below
+  `max(5%, 64 MB)` rather than piling on more connections.
+- **`-raw` measures the socket, not the protocol.** It performs the TLS handshake, writes
+  the request, and then discards the *encrypted* stream without decrypting it — on Linux
+  through a pipe to `/dev/null`, so the bytes never enter user space. That removes AES-GCM,
+  the copy to user space and HTTP parsing: exactly the part of the cost the load generator
+  controls. Measured on a 1 vCPU host at 48 connections, the process went from 33–49% of a
+  core in normal mode to **17–20%** in `-raw` — about half the CPU for the same bytes.
+
+  Throughput did not move, and that is the takeaway: `softirq` was already at 40–50% of the
+  core, so the receive path, not the generator, was the ceiling. Read the `softirq` figure
+  before optimising anything — it is the half of the picture no user-space tool can touch,
+  and it decides whether a faster client would help at all.
+
+  What you give up: status codes (a `403` hotlink rejection looks like a very short
+  transfer), the request counter (the status bar shows `N sent` instead of `N req`), the
+  content itself, and any knowledge of where one response ends. Re-requests are driven by
+  a byte budget derived from `Content-Length`, with an idle timeout as the fallback, so an
+  endpoint that answers `403` to everything will simply look idle. `Failed` therefore only
+  counts connection-level errors. The auto ramp still works — it only needs bytes and
+  failures.
+
+  Use it when the generator is the bottleneck and you want to know what the link can really
+  do; do not use it to decide whether a target is healthy.
+
 - **Exit.** `Ctrl+C` cancels in-flight requests and restores the terminal.
 
 ## Build from source

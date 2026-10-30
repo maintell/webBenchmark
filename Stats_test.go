@@ -65,3 +65,70 @@ func TestSortedNames(t *testing.T) {
 		}
 	}
 }
+
+// 网卡表只该显示真正在动的几条，且按本秒流量从高到低排。
+func TestPickNicsSortsAndFoldsIdle(t *testing.T) {
+	rows := []nicRow{
+		{name: "br-07d13f564ff4", recvRate: 0},
+		{name: "eth0", recvRate: 9 << 20, sentRate: 1 << 20},
+		{name: "he-ipv6", recvRate: 0, recvTotal: 47 << 20},
+		{name: "lo", recvRate: 2 << 20},
+		{name: "veth2099e26", recvRate: 0},
+	}
+
+	shown, quiet := pickNics(rows)
+	if len(shown) != 2 {
+		t.Fatalf("shown = %d, want the 2 moving nics", len(shown))
+	}
+	if shown[0].name != "eth0" || shown[1].name != "lo" {
+		t.Fatalf("shown order = %v, want eth0 then lo by rate", []string{shown[0].name, shown[1].name})
+	}
+	// 三条全零速率的接口必须被折叠掉，否则状态栏又被它们占满。
+	if quiet != 3 {
+		t.Fatalf("quiet = %d, want 3 folded interfaces", quiet)
+	}
+}
+
+// 活跃接口多于上限时只留最快的几条，其余计入折叠。
+func TestPickNicsCapsVisibleRows(t *testing.T) {
+	rows := make([]nicRow, 0, 6)
+	for i := 0; i < 6; i++ {
+		rows = append(rows, nicRow{name: string(rune('a' + i)), recvRate: uint64(i+1) << 20})
+	}
+	shown, quiet := pickNics(rows)
+	if len(shown) != maxVisibleNics {
+		t.Fatalf("shown = %d, want the cap %d", len(shown), maxVisibleNics)
+	}
+	if quiet != 6-maxVisibleNics {
+		t.Fatalf("quiet = %d, want %d", quiet, 6-maxVisibleNics)
+	}
+	if shown[0].recvRate != 6<<20 {
+		t.Fatalf("fastest nic should come first, got %d", shown[0].recvRate)
+	}
+}
+
+func TestMiddleEllipsisKeepsWidth(t *testing.T) {
+	cases := []struct {
+		in    string
+		width int
+	}{
+		{"eth0", 12},
+		{"br-07d13f564ff4", 12},
+		{"vetha5e4fc7", 12},
+		{"a-very-long-interface-name", 9},
+	}
+	for _, c := range cases {
+		got := middleEllipsis(c.in, c.width)
+		if len(got) > c.width {
+			t.Errorf("middleEllipsis(%q,%d) = %q, length %d exceeds width", c.in, c.width, got, len(got))
+		}
+		// 短名字必须原样返回，不能凭空截断。
+		if len(c.in) <= c.width && got != c.in {
+			t.Errorf("middleEllipsis(%q,%d) = %q, want it unchanged", c.in, c.width, got)
+		}
+	}
+	// 折叠点必须在中间，保留结尾的区分部分。
+	if got := middleEllipsis("br-07d13f564ff4", 12); got[len(got)-3:] == "..." {
+		t.Errorf("middleEllipsis should keep the tail, got %q", got)
+	}
+}

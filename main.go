@@ -21,7 +21,7 @@ import (
 	"github.com/apoorvam/goterminal"
 )
 
-const version = "0.13"
+const version = "0.14"
 
 type benchOptions struct {
 	postContent string
@@ -37,6 +37,15 @@ type benchOptions struct {
 	gate        *limiter
 	proxySpoof  bool
 	proto       protoMode
+	recvBuf     int
+	raw         bool
+	rawBudget   int64
+
+	rampStep       float64
+	rampMinGain    float64
+	rampRefineGain float64
+	rampWindow     time.Duration
+	rampNoDuel     bool
 }
 
 var (
@@ -53,16 +62,25 @@ var (
 	xforwardCountry = flag.String("fc", "cn", "country code used to pick X-Forwarded-For addresses")
 	subscribe       = flag.String("sub", "", "subscribe url that returns the target url")
 	noReuse         = flag.Bool("nr", false, "open a new TCP connection for every request instead of reusing connections")
-	requestTimeout  = flag.Int("t", 30, "per-request timeout in seconds, 0 means no timeout")
+	requestTimeout  = flag.Int("t", 30, "idle timeout in seconds: a request fails when no data arrives for this long; 0 disables it")
 	forceIPv4       = flag.Bool("4", false, "force IPv4 only; this is the default")
 	forceIPv6       = flag.Bool("6", false, "force IPv6 only instead of the default IPv4")
 	protoFlag       = flag.String("proto", "http1", "protocol to benchmark with: http1, http2 or http3 (http3 needs the server to support QUIC)")
 	noProbe         = flag.Bool("noprobe", false, "skip the startup protocol capability probe")
 	dnsServer       = flag.String("dns", "8.8.8.8", "dns server used for the target ip display")
-	TerminalWriter  = goterminal.New(os.Stdout)
-	customIP        ipArray
-	headers         headersList
-	targetURL       atomic.Value // string
+	rcvBuf          = flag.Int("rcvbuf", 0, "cap the kernel receive buffer per connection in bytes, 0 lets the kernel auto-tune; lower it only when RAM, not bandwidth, is the constraint")
+	rawMode         = flag.Bool("raw", false, "measure raw socket throughput: after the TLS handshake the encrypted stream is discarded without decrypting. No status codes and no per-request accounting; tcp + http1 only")
+
+	// 自动模式的收敛参数。分辨率优先于速度：宁可多测几个窗口，也不要停在错的一档。
+	rampStep       = flag.Float64("ramp-step", autoStep, "auto mode: multiplicative concurrency step while climbing, e.g. 1.5 grows 4->6->9->14")
+	rampGain       = flag.Float64("ramp-gain", autoMinGain, "auto mode: relative gain over the peak that still counts as an improvement while climbing")
+	rampRefineGain = flag.Float64("ramp-refine-gain", autoRefineGain, "auto mode: smaller gain that still counts as an improvement during the refine pass")
+	rampWindow     = flag.Int("ramp-window", int(autoWindow/time.Second), "auto mode: length of one measurement window in seconds")
+	rampDuelFlag   = flag.Bool("ramp-duel", true, "auto mode: before settling, measure the chosen level and one step above with the same number of windows and keep the faster one")
+	TerminalWriter = goterminal.New(os.Stdout)
+	customIP       ipArray
+	headers        headersList
+	targetURL      atomic.Value // string
 
 	// 分布式模式。主控只开一个 HTTPS 端口，从节点只向外连接。
 	masterListen      = flag.String("master", "", "run as the master node (web console + agent control plane), e.g. -master 0.0.0.0:8443")
@@ -117,10 +135,21 @@ func (f ipFamily) String() string {
 
 // newDialer 把连接重定向到 -i 给出的地址，端口沿用目标 URL 自己的端口，
 // 或者按 -4 / -6 只使用指定地址族。
-func newDialer(ips ipArray, family ipFamily) func(ctx context.Context, network, addr string) (net.Conn, error) {
+func newDialer(ips ipArray, family ipFamily, rcvBuf int) func(ctx context.Context, network, addr string) (net.Conn, error) {
 	dialer := &net.Dialer{
 		Timeout:   30 * time.Second,
 		KeepAlive: 30 * time.Second,
+	}
+	// -rcvbuf 显式给内核接收缓冲设上限，是"内存比带宽更紧"时的取舍：
+	// 一旦设置，内核就不再按 BDP 自动调优，高 RTT 链路的单流速率会被压住。
+	if rcvBuf > 0 {
+		dialer.Control = func(_, _ string, c syscall.RawConn) error {
+			var setErr error
+			if err := c.Control(func(fd uintptr) { setErr = setRecvBuf(fd, rcvBuf) }); err != nil {
+				return err
+			}
+			return setErr
+		}
 	}
 	return func(ctx context.Context, network, addr string) (net.Conn, error) {
 		host, port, err := net.SplitHostPort(addr)
@@ -232,8 +261,8 @@ func newTransport(opts *benchOptions) roundTripperCloser {
 		MaxIdleConnsPerHost: 256,
 		IdleConnTimeout:     90 * time.Second,
 	}
-	if len(opts.customIP) > 0 || opts.family != familyAny {
-		tr.DialContext = newDialer(opts.customIP, opts.family)
+	if len(opts.customIP) > 0 || opts.family != familyAny || opts.recvBuf > 0 {
+		tr.DialContext = newDialer(opts.customIP, opts.family, opts.recvBuf)
 	}
 	return tr
 }
@@ -243,10 +272,10 @@ func runBenchmark(ctx context.Context, opts *benchOptions, target func() string)
 	transport := newTransport(opts)
 	defer transport.CloseIdleConnections()
 
-	client := &http.Client{
-		Transport: transport,
-		Timeout:   opts.timeout,
-	}
+	// 这里刻意不设 client.Timeout：那是"整个请求"的总时限，
+	// 一个大文件在慢链路上必然超过它，于是每个请求都被判失败——目标没问题，
+	// 是我们的秒表掐得太死。超时交给 sendOnce 里的空闲看门，只在真的没数据时触发。
+	client := &http.Client{Transport: transport}
 
 	for {
 		if ctx.Err() != nil {
@@ -290,9 +319,14 @@ func sendOnce(ctx context.Context, client *http.Client, opts *benchOptions, targ
 		body = strings.NewReader(opts.postContent)
 	}
 
-	request, err := http.NewRequestWithContext(ctx, method, target, body)
+	// 请求级 ctx 带空闲看门：只有连续 opts.timeout 没有任何字节才取消，
+	// 持续传输的请求再慢也不会被误杀（细节见 Timeout.go）。
+	reqCtx, guard := newIdleGuard(ctx, opts.timeout)
+
+	request, err := http.NewRequestWithContext(reqCtx, method, target, body)
 	if err != nil {
-		stats.failed.Add(1)
+		guard.stop()
+		stats.recordFailure(err, reqCtx)
 		reportError(err)
 		return false
 	}
@@ -322,11 +356,12 @@ func sendOnce(ctx context.Context, client *http.Client, opts *benchOptions, targ
 
 	resp, err := client.Do(request)
 	if err != nil {
+		guard.stop()
 		// Ctrl+C 打断的在途请求不算失败，也不该刷错误。
 		if ctx.Err() != nil {
 			return false
 		}
-		stats.failed.Add(1)
+		stats.recordFailure(err, reqCtx)
 		reportError(err)
 		return false
 	}
@@ -336,7 +371,8 @@ func sendOnce(ctx context.Context, client *http.Client, opts *benchOptions, targ
 	if resp.StatusCode < http.StatusOK {
 		io.Copy(io.Discard, resp.Body)
 		resp.Body.Close()
-		stats.failed.Add(1)
+		guard.stop()
+		stats.recordFailure(fmt.Errorf("got informational status %d instead of a final response", resp.StatusCode), reqCtx)
 		reportError(fmt.Errorf("got informational status %d instead of a final response", resp.StatusCode))
 		return false
 	}
@@ -344,16 +380,26 @@ func sendOnce(ctx context.Context, client *http.Client, opts *benchOptions, targ
 	// 只有在响应体读完、请求真正结束时才算成功。
 	// 旧写法在拿到响应头时就记成功，读响应体时的超时被直接丢掉，
 	// 于是"截断的请求"被当成成功，Loaded 明显低于实际链路能力。
-	_, copyErr := io.Copy(io.Discard, &countingReader{r: resp.Body})
+	_, copyErr := io.Copy(io.Discard, &countingReader{r: resp.Body, touch: guard.touch})
 	resp.Body.Close()
+	guard.stop()
 	if copyErr != nil {
 		if ctx.Err() != nil {
 			return false
 		}
-		stats.failed.Add(1)
+		stats.recordFailure(copyErr, reqCtx)
 		reportError(copyErr)
 		return false
 	}
+
+	// 4xx/5xx 以前被当成成功计入 requests：压测全绿，实际全在报错。
+	// 这里按失败计，并单独归到 rejected，自动模式据此判断目标是否已经在拒绝负载。
+	if resp.StatusCode >= http.StatusBadRequest {
+		stats.recordStatusCode()
+		reportError(fmt.Errorf("target answered %d %s", resp.StatusCode, http.StatusText(resp.StatusCode)))
+		return false
+	}
+
 	stats.requests.Add(1)
 	return true
 }
@@ -361,14 +407,19 @@ func sendOnce(ctx context.Context, client *http.Client, opts *benchOptions, targ
 // countingReader 边读边累加字节数。
 // 如果等请求结束再一次性加，长时间下载期间 Loaded 会一直停在旧值，
 // 看起来像"没流量"，实际链路早就跑满了。
+// 每次读到数据顺便重置空闲超时：有字节进来就说明链路是活的。
 type countingReader struct {
-	r io.Reader
+	r     io.Reader
+	touch func()
 }
 
 func (c *countingReader) Read(p []byte) (int, error) {
 	n, err := c.r.Read(p)
 	if n > 0 {
 		stats.bytes.Add(uint64(n))
+		if c.touch != nil {
+			c.touch()
+		}
 	}
 	return n, err
 }
@@ -452,7 +503,7 @@ func waitOrDone(ctx context.Context, d time.Duration) bool {
 
 func usage() {
 	fmt.Fprintf(os.Stderr, `webBenchmark version: %s
-Usage: webBenchmark [-c concurrent] [-s target] [-p content] [-r refererUrl] [-f] [-i ip] [-H header]
+Usage: webBenchmark [-c concurrent] [-s target] [-r refererUrl] [-raw] [-rcvbuf bytes] [-H header]
 
 Options:
 `, version)
@@ -473,6 +524,14 @@ Examples:
       benchmark over QUIC, for servers that advertise http3 via Alt-Svc
   webBenchmark -s https://some.website -noprobe
       skip the startup protocol probe (it costs one extra request)
+  webBenchmark -s https://some.website -raw
+      measure the socket instead of the protocol: discard the encrypted stream without
+      decrypting it. Half the client CPU, no status codes, no per-request counting
+  webBenchmark -c 8 -rcvbuf 262144 -s https://some.website
+      low-RAM client: cap the kernel receive buffer per connection (~1MB total instead of
+      ~25MB), at the cost of a lower per-connection ceiling on long-RTT links
+  webBenchmark -s https://some.website -ramp-window 8
+      noisy link: longer measurement windows make the automatic ramp less jittery
   webBenchmark -master 0.0.0.0:8443
       run the master: web console on https://<host>:8443 plus the agent control plane
   webBenchmark -join wb1_xxxxx
@@ -520,6 +579,29 @@ func validateFlags() error {
 	}
 	if *requestTimeout < 0 {
 		return fmt.Errorf("-t must be >= 0, got %d", *requestTimeout)
+	}
+	if *rcvBuf < 0 {
+		return fmt.Errorf("-rcvbuf must be >= 0, got %d", *rcvBuf)
+	}
+	if *rawMode {
+		switch strings.ToLower(strings.TrimSpace(*protoFlag)) {
+		case "", "http1", "http1.1", "h1":
+		default:
+			return errors.New("-raw speaks http1 only; drop -proto or pass -proto http1")
+		}
+	}
+	if *rampStep <= 1 || *rampStep > 4 {
+		return fmt.Errorf("-ramp-step must be > 1 and <= 4, got %g", *rampStep)
+	}
+	if *rampGain <= 0 || *rampGain >= 1 {
+		return fmt.Errorf("-ramp-gain must be inside (0,1), got %g", *rampGain)
+	}
+	// 收敛门槛必须比爬坡门槛小，否则"精细收敛"只是把爬坡重放一遍。
+	if *rampRefineGain <= 0 || *rampRefineGain >= *rampGain {
+		return fmt.Errorf("-ramp-refine-gain must be inside (0,%g), got %g", *rampGain, *rampRefineGain)
+	}
+	if *rampWindow < 1 {
+		return fmt.Errorf("-ramp-window must be >= 1 second, got %d", *rampWindow)
 	}
 	if *forceIPv4 && *forceIPv6 {
 		return errors.New("-4 and -6 are mutually exclusive")
@@ -656,18 +738,25 @@ func main() {
 	}
 
 	opts := &benchOptions{
-		postContent: *postContent,
-		randomPost:  *randomPost,
-		randomSize:  *randomPostSize,
-		referer:     *referer,
-		xforwardfor: *xforwardfor,
-		customIP:    customIP,
-		headers:     headers,
-		noReuse:     *noReuse,
-		timeout:     time.Duration(*requestTimeout) * time.Second,
-		family:      selectedFamily(),
-		proxySpoof:  *proxySpoof,
-		proto:       mode,
+		postContent:    *postContent,
+		randomPost:     *randomPost,
+		randomSize:     *randomPostSize,
+		referer:        *referer,
+		xforwardfor:    *xforwardfor,
+		customIP:       customIP,
+		headers:        headers,
+		noReuse:        *noReuse,
+		timeout:        time.Duration(*requestTimeout) * time.Second,
+		family:         selectedFamily(),
+		proxySpoof:     *proxySpoof,
+		proto:          mode,
+		recvBuf:        *rcvBuf,
+		raw:            *rawMode,
+		rampStep:       *rampStep,
+		rampMinGain:    *rampGain,
+		rampRefineGain: *rampRefineGain,
+		rampWindow:     time.Duration(*rampWindow) * time.Second,
+		rampNoDuel:     !*rampDuelFlag,
 	}
 
 	var wg sync.WaitGroup
@@ -677,6 +766,13 @@ func main() {
 		defer wg.Done()
 		showStat(ctx)
 	}()
+
+	if opts.raw {
+		opts.rawBudget = rawEncryptedSize(probeContentLength(opts, target, *referer))
+		if opts.rawBudget == 0 {
+			fmt.Fprintln(os.Stderr, "raw: response size unknown, re-requests are driven by idle time")
+		}
+	}
 
 	if autoConcurrency() {
 		// 没给 -c 就自己找上限：从小并发起步，逐级提升到吞吐不再增长。
@@ -706,11 +802,15 @@ func main() {
 			routines = len(customIP)
 		}
 		setFixedConcurrency(routines)
+		worker := runBenchmark
+		if opts.raw {
+			worker = runRawBenchmark
+		}
 		for i := 0; i < routines; i++ {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				runBenchmark(ctx, opts, getTargetURL)
+				worker(ctx, opts, getTargetURL)
 			}()
 		}
 	}
